@@ -436,6 +436,59 @@ def handle_Index(the_class):
             self.search_ex(n, swig_ptr(x), numeric_type, k, swig_ptr(D), swig_ptr(I), params)
         return D, I
 
+    def replacement_knn_query_adaptive_light(
+            self,
+            x,
+            k=1,
+            ef_init=128,
+            enable_stop=True,
+            num_threads=-1,
+            filter=None,
+            early_stop_ratio=0.6,
+            tmin_pops=25,
+            super_easy_gamma_ratio=np.nan,
+            mid_easy_upper_gamma_ratio=np.nan):
+        """Compatibility wrapper for the hnswlib-style adaptive-light query API."""
+
+        if filter is not None:
+            raise NotImplementedError(
+                "faiss knn_query_adaptive_light does not support Python-side filters")
+
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+
+        x = np.ascontiguousarray(x, dtype='float32')
+        D = np.empty((n, k), dtype=np.float32)
+        I = np.empty((n, k), dtype=np.int64)
+
+        params = faiss.SearchParametersHNSWAdaptiveLight()
+        params.efSearch = int(ef_init)
+        params.efMax = max(int(ef_init), 1024)
+        params.enable_stop = bool(enable_stop)
+        params.tmin_pops = int(tmin_pops)
+        params.early_stop_ratio = float(early_stop_ratio)
+        params.super_easy_gamma_ratio = float(super_easy_gamma_ratio)
+        params.mid_easy_upper_gamma_ratio = float(mid_easy_upper_gamma_ratio)
+        params.bounded_queue = True
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.knn_query_adaptive_light_c(
+                n, swig_ptr(x), k, swig_ptr(D), swig_ptr(I), params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return I, D
+
     def replacement_search_and_reconstruct(self, x, k, *, params=None, D=None, I=None, R=None):
         """Find the k nearest neighbors of the set of vectors x in the index,
         and return an approximation of these vectors.
@@ -888,6 +941,8 @@ def handle_Index(the_class):
     replace_method(the_class, 'assign', replacement_assign)
     replace_method(the_class, 'train', replacement_train)
     replace_method(the_class, 'search', replacement_search)
+    replace_method(the_class, 'knn_query_adaptive_light',
+                   replacement_knn_query_adaptive_light, ignore_missing=True)
     replace_method(the_class, 'remove_ids', replacement_remove_ids)
     replace_method(the_class, 'reconstruct', replacement_reconstruct)
     replace_method(the_class, 'reconstruct_batch',

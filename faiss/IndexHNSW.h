@@ -78,6 +78,14 @@ struct IndexHNSW : Index {
             idx_t* labels,
             const SearchParameters* params = nullptr) const override;
 
+    void knn_query_adaptive_light(
+            idx_t n,
+            const float* x,
+            idx_t k,
+            float* distances,
+            idx_t* labels,
+            const SearchParameters* params = nullptr) const;
+
     void range_search(
             idx_t n,
             const float* x,

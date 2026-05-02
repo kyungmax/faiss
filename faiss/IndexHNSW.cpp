@@ -9,6 +9,7 @@
 
 #include <omp.h>
 #include <atomic>
+#include <cmath>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -314,6 +315,88 @@ void hnsw_search(
     hnsw_stats.combine({n1, n2, ndis, nhops});
 }
 
+template <class BlockResultHandler>
+void hnsw_search_adaptive_light(
+        const IndexHNSW* index,
+        idx_t n,
+        const float* x,
+        BlockResultHandler& bres,
+        const SearchParameters* params_in) {
+    FAISS_THROW_IF_NOT_MSG(
+            index->storage,
+            "No storage index, please use IndexHNSWFlat (or variants) "
+            "instead of IndexHNSW directly");
+
+    const HNSW& hnsw = index->hnsw;
+    SearchParametersHNSWAdaptiveLight default_params;
+    default_params.efSearch = hnsw.efSearch;
+    default_params.check_relative_distance = hnsw.check_relative_distance;
+    default_params.bounded_queue = true;
+
+    const SearchParametersHNSWAdaptiveLight* params = &default_params;
+    if (params_in) {
+        params = dynamic_cast<const SearchParametersHNSWAdaptiveLight*>(
+                params_in);
+        FAISS_THROW_IF_NOT_MSG(
+                params,
+                "params must be SearchParametersHNSWAdaptiveLight");
+    }
+
+    size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
+
+    idx_t check_period = InterruptCallback::get_period_hint(
+            hnsw.max_level * index->d * std::max(params->efSearch, 1));
+
+    for (idx_t i0 = 0; i0 < n; i0 += check_period) {
+        idx_t i1 = std::min(i0 + check_period, n);
+        std::exception_ptr ex;
+        std::atomic<bool> interrupt{false};
+
+#pragma omp parallel if (i1 - i0 > 1)
+        {
+            std::unique_ptr<VisitedTable> vt;
+            std::unique_ptr<typename BlockResultHandler::SingleResultHandler>
+                    res;
+            std::unique_ptr<DistanceComputer> dis;
+            try {
+                vt = std::make_unique<VisitedTable>(
+                        index->ntotal, hnsw.use_visited_hashset);
+                res = std::make_unique<
+                        typename BlockResultHandler::SingleResultHandler>(bres);
+                dis.reset(storage_distance_computer(index->storage));
+            } catch (...) {
+                omp_capture_exception(ex, [&] { interrupt = true; });
+            }
+
+#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(guided)
+            for (idx_t i = i0; i < i1; i++) {
+                if (interrupt.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                try {
+                    res->begin(i);
+                    dis->set_query(x + i * index->d);
+
+                    HNSWStats stats = hnsw.search_adaptive_light(
+                            *dis, index, *res, *vt, params);
+                    n1 += stats.n1;
+                    n2 += stats.n2;
+                    ndis += stats.ndis;
+                    nhops += stats.nhops;
+                    res->end();
+                    vt->advance();
+                } catch (...) {
+                    omp_capture_exception(ex, [&] { interrupt = true; });
+                }
+            }
+        }
+        omp_rethrow_if_exception(ex);
+        InterruptCallback::check();
+    }
+
+    hnsw_stats.combine({n1, n2, ndis, nhops});
+}
+
 } // anonymous namespace
 
 void IndexHNSW::search(
@@ -334,6 +417,31 @@ void IndexHNSW::search(
         // we need to revert the negated distances
         for (idx_t i = 0; i < k * n; i++) {
             distances[i] = -distances[i];
+        }
+    }
+}
+
+void IndexHNSW::knn_query_adaptive_light(
+        idx_t n,
+        const float* x,
+        idx_t k,
+        float* distances,
+        idx_t* labels,
+        const SearchParameters* params) const {
+    FAISS_THROW_IF_NOT(k > 0);
+
+    using RH = HeapBlockResultHandler<HNSW::C>;
+    RH bres(n, distances, labels, k);
+
+    hnsw_search_adaptive_light(this, n, x, bres, params);
+
+    if (is_similarity_metric(this->metric_type)) {
+        for (idx_t i = 0; i < k * n; i++) {
+            if (labels[i] < 0) {
+                distances[i] = std::numeric_limits<float>::infinity();
+            } else if (std::isfinite(distances[i])) {
+                distances[i] = 1.0f + distances[i];
+            }
         }
     }
 }

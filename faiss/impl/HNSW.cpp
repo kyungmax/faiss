@@ -7,9 +7,11 @@
 
 #include <faiss/impl/HNSW.h>
 
+#include <cmath>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdlib>
+#include <limits>
 
 #include <faiss/IndexHNSW.h>
 
@@ -619,6 +621,23 @@ static inline void extract_search_params(
     }
 }
 
+static inline float raw_distance_to_hnswlib_distance(
+        float raw_distance,
+        bool is_similarity_metric) {
+    // hnswlib uses 1 - similarity for IP/cosine, while Faiss internally
+    // traverses similarity HNSW with negated similarities.
+    return is_similarity_metric ? (1.0f + raw_distance) : raw_distance;
+}
+
+static inline size_t resolve_scaled_shrink_ef(
+        size_t configured_ef,
+        double scale,
+        size_t min_ef) {
+    const size_t raw_ef =
+            static_cast<size_t>(std::llround((double)configured_ef * scale));
+    return std::min(configured_ef, std::max(min_ef, raw_ef));
+}
+
 /** Do a BFS on the candidates list */
 int search_from_candidates(
         const HNSW& hnsw,
@@ -754,6 +773,307 @@ int search_from_candidates(
     }
 
     return nres;
+}
+
+int search_from_candidates_adaptive_light(
+        const HNSW& hnsw,
+        const IndexHNSW* index,
+        DistanceComputer& qdis,
+        ResultHandler& res,
+        int k_search,
+        HNSW::storage_idx_t nearest,
+        float d_nearest,
+        VisitedTable& vt,
+        HNSWStats& stats,
+        const SearchParametersHNSWAdaptiveLight& params) {
+    static constexpr size_t HARD_ONLY_STAG_LIMIT = 20;
+    static constexpr int CLASSIFY_START = 4;
+    static constexpr int CLASSIFY_END = 16;
+    static constexpr float CHR_EMA_DECAY = 0.8f;
+    static constexpr float CHR_EMA_UPDATE = 1.0f - CHR_EMA_DECAY;
+
+    FAISS_THROW_IF_NOT_MSG(
+            params.bounded_queue,
+            "adaptive-light requires SearchParametersHNSWAdaptiveLight.bounded_queue=true");
+
+    const bool similarity_metric = is_similarity_metric(index->metric_type);
+    const IDSelector* sel = params.sel;
+
+    size_t ef_cur = std::max<size_t>(
+            std::max<size_t>(static_cast<size_t>(params.efSearch), 1),
+            static_cast<size_t>(k_search));
+    ef_cur = std::min(
+            ef_cur,
+            std::max<size_t>(static_cast<size_t>(params.efMax), 1));
+    const size_t configured_ef_cur = ef_cur;
+
+    bool is_easy_query = false;
+    bool is_super_easy_query = false;
+    bool is_mid_easy_query = false;
+    bool classification_evaluated = false;
+    bool effective_ef_shrink_applied = false;
+    int full_pop_count = 0;
+    int stagnation_count = 0;
+    float prev_furthest = std::numeric_limits<float>::max();
+    float smoothed_chr_ema = std::numeric_limits<float>::quiet_NaN();
+    float classify_smoothed_chr_sum = 0.0f;
+    int classify_smoothed_chr_count = 0;
+    float classify_chr_mean = std::numeric_limits<float>::quiet_NaN();
+    const bool direct_classifier_threshold_enabled =
+            std::isfinite(params.early_stop_ratio);
+    const bool super_easy_policy_enabled = direct_classifier_threshold_enabled &&
+            std::isfinite(params.super_easy_gamma_ratio);
+    const bool mid_easy_bucket_policy_enabled =
+            direct_classifier_threshold_enabled &&
+            std::isfinite(params.mid_easy_upper_gamma_ratio);
+    const int effective_tmin_pops = direct_classifier_threshold_enabled
+            ? std::max(params.tmin_pops, CLASSIFY_END)
+            : params.tmin_pops;
+
+    std::priority_queue<Node> top_candidates;
+    std::priority_queue<Node, std::vector<Node>, std::greater<Node>>
+            candidate_set;
+
+    float lower_bound = std::numeric_limits<float>::max();
+    candidate_set.emplace(d_nearest, nearest);
+    vt.set(nearest);
+
+    if (!sel || sel->is_member(nearest)) {
+        top_candidates.emplace(d_nearest, nearest);
+        lower_bound = d_nearest;
+    }
+
+    int ndis = 0;
+    int nstep = 0;
+
+    auto push_candidate = [&](idx_t idx, float dis) {
+        candidate_set.emplace(dis, idx);
+        if (!sel || sel->is_member(idx)) {
+            top_candidates.emplace(dis, idx);
+            if (top_candidates.size() > ef_cur) {
+                top_candidates.pop();
+            }
+            if (!top_candidates.empty()) {
+                lower_bound = top_candidates.top().first;
+            }
+        }
+    };
+
+    while (!candidate_set.empty()) {
+        float candidate_dist = candidate_set.top().first;
+        storage_idx_t current = candidate_set.top().second;
+
+        if (candidate_dist > lower_bound && top_candidates.size() == ef_cur) {
+            break;
+        }
+
+        candidate_set.pop();
+
+        size_t begin, end;
+        hnsw.neighbor_range(current, 0, &begin, &end);
+
+        size_t jmax = begin;
+        for (size_t j = begin; j < end; j++) {
+            int v1 = hnsw.neighbors[j];
+            if (v1 < 0) {
+                break;
+            }
+            vt.prefetch(v1);
+            jmax += 1;
+        }
+
+        int counter = 0;
+        storage_idx_t saved_j[4];
+
+        for (size_t j = begin; j < jmax; j++) {
+            storage_idx_t v1 = hnsw.neighbors[j];
+            saved_j[counter] = v1;
+            counter += vt.set(v1) ? 1 : 0;
+
+            if (counter == 4) {
+                float dis[4];
+                qdis.distances_batch_4(
+                        saved_j[0],
+                        saved_j[1],
+                        saved_j[2],
+                        saved_j[3],
+                        dis[0],
+                        dis[1],
+                        dis[2],
+                        dis[3]);
+
+                for (int id4 = 0; id4 < 4; id4++) {
+                    if (top_candidates.size() < ef_cur ||
+                        dis[id4] < lower_bound) {
+                        push_candidate(saved_j[id4], dis[id4]);
+                    }
+                }
+
+                ndis += 4;
+                counter = 0;
+            }
+        }
+
+        for (int icnt = 0; icnt < counter; icnt++) {
+            float dis = qdis(saved_j[icnt]);
+            if (top_candidates.size() < ef_cur || dis < lower_bound) {
+                push_candidate(saved_j[icnt], dis);
+            }
+            ndis += 1;
+        }
+
+        bool stop_search = false;
+        if (top_candidates.size() == ef_cur && !top_candidates.empty()) {
+            full_pop_count++;
+            float furthest_dist = raw_distance_to_hnswlib_distance(
+                    top_candidates.top().first,
+                    similarity_metric);
+            const float candidate_dist_hnswlib =
+                    raw_distance_to_hnswlib_distance(
+                            candidate_dist,
+                            similarity_metric);
+            const float chr =
+                    candidate_dist_hnswlib / std::max(furthest_dist, 1e-6f);
+            bool rebased_after_shrink = false;
+
+            if (std::isnan(smoothed_chr_ema)) {
+                smoothed_chr_ema = chr;
+            } else {
+                smoothed_chr_ema =
+                        CHR_EMA_DECAY * smoothed_chr_ema + CHR_EMA_UPDATE * chr;
+            }
+
+            if (full_pop_count >= CLASSIFY_START &&
+                full_pop_count <= CLASSIFY_END) {
+                classify_smoothed_chr_sum += smoothed_chr_ema;
+                classify_smoothed_chr_count++;
+
+                if (!classification_evaluated &&
+                    full_pop_count == CLASSIFY_END) {
+                    classification_evaluated = true;
+                    if (direct_classifier_threshold_enabled) {
+                        classify_chr_mean = classify_smoothed_chr_sum /
+                                static_cast<float>(classify_smoothed_chr_count);
+                        is_easy_query =
+                                classify_chr_mean <= params.early_stop_ratio;
+                        if (is_easy_query) {
+                            const float classify_chr_ratio =
+                                    classify_chr_mean /
+                                    std::max(params.early_stop_ratio, 1e-6f);
+                            if (super_easy_policy_enabled) {
+                                is_super_easy_query =
+                                        classify_chr_ratio <=
+                                        params.super_easy_gamma_ratio;
+                            }
+                            if (mid_easy_bucket_policy_enabled) {
+                                is_mid_easy_query =
+                                        classify_chr_ratio <=
+                                        params.mid_easy_upper_gamma_ratio;
+                            }
+                        }
+                    }
+
+                    if (!effective_ef_shrink_applied) {
+                        size_t shrunk_ef_cur = configured_ef_cur;
+                        const size_t shrink_super_easy_ef =
+                                resolve_scaled_shrink_ef(
+                                        configured_ef_cur,
+                                        0.25,
+                                        128);
+                        const size_t shrink_easy_ef =
+                                std::max<size_t>(1, configured_ef_cur / 2);
+                        const size_t shrink_mid_easy_ef =
+                                resolve_scaled_shrink_ef(
+                                        configured_ef_cur,
+                                        0.50,
+                                        128);
+                        const size_t shrink_edge_easy_ef =
+                                resolve_scaled_shrink_ef(
+                                        configured_ef_cur,
+                                        0.75,
+                                        256);
+
+                        if (super_easy_policy_enabled && is_super_easy_query) {
+                            shrunk_ef_cur = shrink_super_easy_ef;
+                        } else if (is_easy_query) {
+                            if (mid_easy_bucket_policy_enabled) {
+                                shrunk_ef_cur = is_mid_easy_query
+                                        ? shrink_mid_easy_ef
+                                        : shrink_edge_easy_ef;
+                            } else {
+                                shrunk_ef_cur = shrink_easy_ef;
+                            }
+                        }
+                        shrunk_ef_cur =
+                                std::max<size_t>(
+                                        shrunk_ef_cur,
+                                        static_cast<size_t>(k_search));
+
+                        if (shrunk_ef_cur < ef_cur) {
+                            ef_cur = shrunk_ef_cur;
+                            while (top_candidates.size() > ef_cur) {
+                                top_candidates.pop();
+                            }
+                            if (!top_candidates.empty()) {
+                                lower_bound = top_candidates.top().first;
+                                furthest_dist =
+                                        raw_distance_to_hnswlib_distance(
+                                                top_candidates.top().first,
+                                                similarity_metric);
+                            }
+                            prev_furthest = furthest_dist;
+                            stagnation_count = 0;
+                            rebased_after_shrink = true;
+                        }
+                        effective_ef_shrink_applied = true;
+                    }
+                }
+            }
+
+            const bool hard_stop_enabled = params.enable_stop &&
+                    direct_classifier_threshold_enabled &&
+                    classification_evaluated && !is_easy_query &&
+                    full_pop_count >= effective_tmin_pops &&
+                    !rebased_after_shrink;
+            if (hard_stop_enabled) {
+                if (furthest_dist >= prev_furthest) {
+                    stagnation_count++;
+                } else {
+                    stagnation_count = 0;
+                }
+
+                if (static_cast<size_t>(std::max(stagnation_count, 0)) >=
+                    HARD_ONLY_STAG_LIMIT) {
+                    stop_search = true;
+                }
+            }
+
+            prev_furthest = furthest_dist;
+        }
+
+        nstep++;
+        if (stop_search) {
+            break;
+        }
+    }
+
+    while (top_candidates.size() > static_cast<size_t>(k_search)) {
+        top_candidates.pop();
+    }
+
+    while (!top_candidates.empty()) {
+        res.add_result(top_candidates.top().first, top_candidates.top().second);
+        top_candidates.pop();
+    }
+
+    stats.n1++;
+    if (candidate_set.empty()) {
+        stats.n2++;
+    }
+    stats.ndis += ndis;
+    stats.nhops += nstep;
+
+    return 0;
 }
 
 int search_from_candidates_panorama(
@@ -1290,6 +1610,50 @@ HNSWStats HNSW::search(
     }
 
     vt.advance();
+
+    return stats;
+}
+
+HNSWStats HNSW::search_adaptive_light(
+        DistanceComputer& qdis,
+        const IndexHNSW* index,
+        ResultHandler& res,
+        VisitedTable& vt,
+        const SearchParametersHNSWAdaptiveLight* params) const {
+    HNSWStats stats;
+    if (entry_point == -1) {
+        return stats;
+    }
+
+    SearchParametersHNSWAdaptiveLight default_params;
+    default_params.efSearch = this->efSearch;
+    default_params.check_relative_distance = this->check_relative_distance;
+    default_params.bounded_queue = true;
+    const SearchParametersHNSWAdaptiveLight* active_params =
+            params ? params : &default_params;
+
+    int k = extract_k_from_ResultHandler(res);
+
+    storage_idx_t nearest = entry_point;
+    float d_nearest = qdis(nearest);
+
+    for (int level = max_level; level >= 1; level--) {
+        HNSWStats local_stats =
+                greedy_update_nearest(*this, qdis, level, nearest, d_nearest);
+        stats.combine(local_stats);
+    }
+
+    search_from_candidates_adaptive_light(
+            *this,
+            index,
+            qdis,
+            res,
+            k,
+            nearest,
+            d_nearest,
+            vt,
+            stats,
+            *active_params);
 
     return stats;
 }

@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <limits>
 #include <optional>
 #include <queue>
 #include <vector>
@@ -54,6 +55,17 @@ struct SearchParametersHNSW : SearchParameters {
     bool bounded_queue = true;
 
     ~SearchParametersHNSW() {}
+};
+
+struct SearchParametersHNSWAdaptiveLight : SearchParametersHNSW {
+    bool enable_stop = true;
+    int efMax = 1024;
+    int tmin_pops = 25;
+    float early_stop_ratio = 0.6f;
+    float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN();
+    float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN();
+
+    ~SearchParametersHNSWAdaptiveLight() {}
 };
 
 struct HNSW {
@@ -196,6 +208,13 @@ struct HNSW {
             ResultHandler& res,
             VisitedTable& vt,
             const SearchParameters* params = nullptr) const;
+
+    HNSWStats search_adaptive_light(
+            DistanceComputer& qdis,
+            const IndexHNSW* index,
+            ResultHandler& res,
+            VisitedTable& vt,
+            const SearchParametersHNSWAdaptiveLight* params = nullptr) const;
 
     /// search only in level 0 from a given vertex
     void search_level_0(
