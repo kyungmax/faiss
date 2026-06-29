@@ -53,6 +53,36 @@ def _numeric_to_str(numeric_type):
         raise ValueError("numeric type must be either faiss.Float32, faiss.Float16, or faiss.Int8")
 
 
+def _selector_from_hnsw_filter(filter_arg):
+    if filter_arg is None:
+        return None
+    if isinstance(filter_arg, IDSelector):
+        return filter_arg
+    raise NotImplementedError(
+        "faiss adaptive-light wrappers accept filter only as a faiss.IDSelector; "
+        "hnswlib-style Python callables are not supported")
+
+
+def _assign_paper_bucket_gamma_ratios(params, bucket_gamma_ratios):
+    if int(params.paper_bucket_count) < 2 or int(params.paper_bucket_count) > 8:
+        raise ValueError("paper_bucket_count must be in [2, 8]")
+    gamma_ratios = [float(value) for value in bucket_gamma_ratios]
+    if len(gamma_ratios) != int(params.paper_bucket_count) - 1:
+        raise ValueError(
+            "bucket_gamma_ratios must contain exactly paper_bucket_count - 1 entries")
+    for attr in (
+            "bucket_gamma_ratio_0",
+            "bucket_gamma_ratio_1",
+            "bucket_gamma_ratio_2",
+            "bucket_gamma_ratio_3",
+            "bucket_gamma_ratio_4",
+            "bucket_gamma_ratio_5",
+            "bucket_gamma_ratio_6"):
+        setattr(params, attr, np.nan)
+    for i, value in enumerate(gamma_ratios):
+        setattr(params, f"bucket_gamma_ratio_{i}", float(value))
+
+
 def replace_method(the_class, name, replacement, ignore_missing=False):
     """ Replaces a method in a class with another version. The old method
     is renamed to method_name_c (because presumably it was implemented in C) """
@@ -450,9 +480,7 @@ def handle_Index(the_class):
             mid_easy_upper_gamma_ratio=np.nan):
         """Compatibility wrapper for the hnswlib-style adaptive-light query API."""
 
-        if filter is not None:
-            raise NotImplementedError(
-                "faiss knn_query_adaptive_light does not support Python-side filters")
+        selector = _selector_from_hnsw_filter(filter)
 
         x = np.asarray(x)
         if x.ndim == 1:
@@ -474,6 +502,60 @@ def handle_Index(the_class):
         params.super_easy_gamma_ratio = float(super_easy_gamma_ratio)
         params.mid_easy_upper_gamma_ratio = float(mid_easy_upper_gamma_ratio)
         params.bounded_queue = True
+        params.sel = selector
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.knn_query_adaptive_light_c(
+                n, swig_ptr(x), k, swig_ptr(D), swig_ptr(I), params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return I, D
+
+    def replacement_knn_query_adaptive_light_paper_bucket(
+            self,
+            x,
+            k=1,
+            ef_init=128,
+            enable_stop=True,
+            num_threads=-1,
+            filter=None,
+            early_stop_ratio=0.6,
+            tmin_pops=25,
+            paper_bucket_count=4,
+            bucket_gamma_ratios=()):
+        """Compatibility wrapper for hnswlib-style paper-bucket adaptive-light."""
+
+        selector = _selector_from_hnsw_filter(filter)
+
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+
+        x = np.ascontiguousarray(x, dtype="float32")
+        D = np.empty((n, k), dtype=np.float32)
+        I = np.empty((n, k), dtype=np.int64)
+
+        params = faiss.SearchParametersHNSWAdaptiveLight()
+        params.efSearch = int(ef_init)
+        params.efMax = max(int(ef_init), 1024)
+        params.enable_stop = bool(enable_stop)
+        params.tmin_pops = int(tmin_pops)
+        params.early_stop_ratio = float(early_stop_ratio)
+        params.bounded_queue = True
+        params.paper_bucket_mode = True
+        params.paper_bucket_count = int(paper_bucket_count)
+        params.sel = selector
+        _assign_paper_bucket_gamma_ratios(params, bucket_gamma_ratios)
 
         prev_num_threads = None
         if num_threads is not None and int(num_threads) > 0:
@@ -943,6 +1025,9 @@ def handle_Index(the_class):
     replace_method(the_class, 'search', replacement_search)
     replace_method(the_class, 'knn_query_adaptive_light',
                    replacement_knn_query_adaptive_light, ignore_missing=True)
+    if hasattr(the_class, "knn_query_adaptive_light_c"):
+        setattr(the_class, "knn_query_adaptive_light_paper_bucket",
+                replacement_knn_query_adaptive_light_paper_bucket)
     replace_method(the_class, 'remove_ids', replacement_remove_ids)
     replace_method(the_class, 'reconstruct', replacement_reconstruct)
     replace_method(the_class, 'reconstruct_batch',

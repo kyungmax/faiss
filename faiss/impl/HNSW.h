@@ -64,6 +64,15 @@ struct SearchParametersHNSWAdaptiveLight : SearchParametersHNSW {
     float early_stop_ratio = 0.6f;
     float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN();
     float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN();
+    bool paper_bucket_mode = false;
+    int paper_bucket_count = 4;
+    float bucket_gamma_ratio_0 = std::numeric_limits<float>::quiet_NaN();
+    float bucket_gamma_ratio_1 = std::numeric_limits<float>::quiet_NaN();
+    float bucket_gamma_ratio_2 = std::numeric_limits<float>::quiet_NaN();
+    float bucket_gamma_ratio_3 = std::numeric_limits<float>::quiet_NaN();
+    float bucket_gamma_ratio_4 = std::numeric_limits<float>::quiet_NaN();
+    float bucket_gamma_ratio_5 = std::numeric_limits<float>::quiet_NaN();
+    float bucket_gamma_ratio_6 = std::numeric_limits<float>::quiet_NaN();
 
     ~SearchParametersHNSWAdaptiveLight() {}
 };

@@ -638,6 +638,79 @@ static inline size_t resolve_scaled_shrink_ef(
     return std::min(configured_ef, std::max(min_ef, raw_ef));
 }
 
+static inline float get_bucket_gamma_ratio(
+        const SearchParametersHNSWAdaptiveLight& params,
+        size_t index) {
+    switch (index) {
+        case 0:
+            return params.bucket_gamma_ratio_0;
+        case 1:
+            return params.bucket_gamma_ratio_1;
+        case 2:
+            return params.bucket_gamma_ratio_2;
+        case 3:
+            return params.bucket_gamma_ratio_3;
+        case 4:
+            return params.bucket_gamma_ratio_4;
+        case 5:
+            return params.bucket_gamma_ratio_5;
+        case 6:
+            return params.bucket_gamma_ratio_6;
+        default:
+            return std::numeric_limits<float>::quiet_NaN();
+    }
+}
+
+static inline void validate_paper_bucket_routing_config(
+        const SearchParametersHNSWAdaptiveLight& params) {
+    const int bucket_count = params.paper_bucket_count;
+    FAISS_THROW_IF_NOT_MSG(
+            bucket_count >= 2 && bucket_count <= 8,
+            "paper_bucket_count must be in [2, 8]");
+
+    float prev_gamma = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < bucket_count - 1; i++) {
+        const float gamma = get_bucket_gamma_ratio(params, i);
+        FAISS_THROW_IF_NOT_MSG(
+                std::isfinite(gamma),
+                "bucket_gamma_ratios must be finite");
+        FAISS_THROW_IF_NOT_MSG(
+                gamma >= 0.0f && gamma <= 1.0f,
+                "bucket_gamma_ratios must lie in [0, 1]");
+        FAISS_THROW_IF_NOT_MSG(
+                gamma >= prev_gamma,
+                "bucket_gamma_ratios must be monotone nondecreasing");
+        prev_gamma = gamma;
+    }
+}
+
+static inline size_t resolve_paper_bucket_shrink_ef(
+        size_t configured_ef,
+        size_t k,
+        const SearchParametersHNSWAdaptiveLight& params,
+        float classify_chr_ratio) {
+    validate_paper_bucket_routing_config(params);
+
+    const size_t bucket_count = static_cast<size_t>(params.paper_bucket_count);
+    size_t selected_bucket_index = bucket_count - 1;
+    for (size_t i = 0; i + 1 < bucket_count; i++) {
+        if (classify_chr_ratio <= get_bucket_gamma_ratio(params, i)) {
+            selected_bucket_index = i;
+            break;
+        }
+    }
+
+    if (selected_bucket_index + 1 >= bucket_count) {
+        return configured_ef;
+    }
+
+    size_t routed_ef =
+            (configured_ef * (selected_bucket_index + 1)) / bucket_count;
+    routed_ef = std::max<size_t>(1, routed_ef);
+    routed_ef = std::min(configured_ef, routed_ef);
+    return std::max(routed_ef, k);
+}
+
 /** Do a BFS on the candidates list */
 int search_from_candidates(
         const HNSW& hnsw,
@@ -821,10 +894,15 @@ int search_from_candidates_adaptive_light(
     float classify_chr_mean = std::numeric_limits<float>::quiet_NaN();
     const bool direct_classifier_threshold_enabled =
             std::isfinite(params.early_stop_ratio);
+    if (params.paper_bucket_mode) {
+        validate_paper_bucket_routing_config(params);
+    }
     const bool super_easy_policy_enabled = direct_classifier_threshold_enabled &&
+            !params.paper_bucket_mode &&
             std::isfinite(params.super_easy_gamma_ratio);
     const bool mid_easy_bucket_policy_enabled =
             direct_classifier_threshold_enabled &&
+            !params.paper_bucket_mode &&
             std::isfinite(params.mid_easy_upper_gamma_ratio);
     const int effective_tmin_pops = direct_classifier_threshold_enabled
             ? std::max(params.tmin_pops, CLASSIFY_END)
@@ -975,39 +1053,51 @@ int search_from_candidates_adaptive_light(
 
                     if (!effective_ef_shrink_applied) {
                         size_t shrunk_ef_cur = configured_ef_cur;
-                        const size_t shrink_super_easy_ef =
-                                resolve_scaled_shrink_ef(
+                        if (params.paper_bucket_mode) {
+                            if (is_easy_query) {
+                                const float classify_chr_ratio =
+                                        classify_chr_mean /
+                                        std::max(params.early_stop_ratio, 1e-6f);
+                                shrunk_ef_cur = resolve_paper_bucket_shrink_ef(
                                         configured_ef_cur,
-                                        0.25,
-                                        128);
-                        const size_t shrink_easy_ef =
-                                std::max<size_t>(1, configured_ef_cur / 2);
-                        const size_t shrink_mid_easy_ef =
-                                resolve_scaled_shrink_ef(
-                                        configured_ef_cur,
-                                        0.50,
-                                        128);
-                        const size_t shrink_edge_easy_ef =
-                                resolve_scaled_shrink_ef(
-                                        configured_ef_cur,
-                                        0.75,
-                                        256);
-
-                        if (super_easy_policy_enabled && is_super_easy_query) {
-                            shrunk_ef_cur = shrink_super_easy_ef;
-                        } else if (is_easy_query) {
-                            if (mid_easy_bucket_policy_enabled) {
-                                shrunk_ef_cur = is_mid_easy_query
-                                        ? shrink_mid_easy_ef
-                                        : shrink_edge_easy_ef;
-                            } else {
-                                shrunk_ef_cur = shrink_easy_ef;
+                                        static_cast<size_t>(k_search),
+                                        params,
+                                        classify_chr_ratio);
                             }
+                        } else {
+                            const size_t shrink_super_easy_ef =
+                                    resolve_scaled_shrink_ef(
+                                            configured_ef_cur,
+                                            0.25,
+                                            128);
+                            const size_t shrink_easy_ef =
+                                    std::max<size_t>(1, configured_ef_cur / 2);
+                            const size_t shrink_mid_easy_ef =
+                                    resolve_scaled_shrink_ef(
+                                            configured_ef_cur,
+                                            0.50,
+                                            128);
+                            const size_t shrink_edge_easy_ef =
+                                    resolve_scaled_shrink_ef(
+                                            configured_ef_cur,
+                                            0.75,
+                                            256);
+
+                            if (super_easy_policy_enabled && is_super_easy_query) {
+                                shrunk_ef_cur = shrink_super_easy_ef;
+                            } else if (is_easy_query) {
+                                if (mid_easy_bucket_policy_enabled) {
+                                    shrunk_ef_cur = is_mid_easy_query
+                                            ? shrink_mid_easy_ef
+                                            : shrink_edge_easy_ef;
+                                } else {
+                                    shrunk_ef_cur = shrink_easy_ef;
+                                }
+                            }
+                            shrunk_ef_cur = std::max<size_t>(
+                                    shrunk_ef_cur,
+                                    static_cast<size_t>(k_search));
                         }
-                        shrunk_ef_cur =
-                                std::max<size_t>(
-                                        shrunk_ef_cur,
-                                        static_cast<size_t>(k_search));
 
                         if (shrunk_ef_cur < ef_cur) {
                             ef_cur = shrunk_ef_cur;
