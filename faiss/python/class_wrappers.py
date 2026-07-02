@@ -53,14 +53,14 @@ def _numeric_to_str(numeric_type):
         raise ValueError("numeric type must be either faiss.Float32, faiss.Float16, or faiss.Int8")
 
 
-def _selector_from_hnsw_filter(filter_arg):
+def _selector_from_faiss_filter(filter_arg):
     if filter_arg is None:
         return None
     if isinstance(filter_arg, IDSelector):
         return filter_arg
     raise NotImplementedError(
         "faiss adaptive-light wrappers accept filter only as a faiss.IDSelector; "
-        "hnswlib-style Python callables are not supported")
+        "Python callables are not supported")
 
 
 def _assign_paper_bucket_gamma_ratios(params, bucket_gamma_ratios):
@@ -478,9 +478,9 @@ def handle_Index(the_class):
             tmin_pops=25,
             super_easy_gamma_ratio=np.nan,
             mid_easy_upper_gamma_ratio=np.nan):
-        """Compatibility wrapper for the hnswlib-style adaptive-light query API."""
+        """Python wrapper for the Faiss adaptive-light query API."""
 
-        selector = _selector_from_hnsw_filter(filter)
+        selector = _selector_from_faiss_filter(filter)
 
         x = np.asarray(x)
         if x.ndim == 1:
@@ -530,9 +530,9 @@ def handle_Index(the_class):
             tmin_pops=25,
             paper_bucket_count=4,
             bucket_gamma_ratios=()):
-        """Compatibility wrapper for hnswlib-style paper-bucket adaptive-light."""
+        """Python wrapper for the Faiss paper-bucket adaptive-light query API."""
 
-        selector = _selector_from_hnsw_filter(filter)
+        selector = _selector_from_faiss_filter(filter)
 
         x = np.asarray(x)
         if x.ndim == 1:
@@ -570,6 +570,406 @@ def handle_Index(the_class):
                 faiss.omp_set_num_threads(int(prev_num_threads))
 
         return I, D
+
+    def replacement_knn_query_hide_node(
+            self,
+            x,
+            hide_labels,
+            k=1,
+            num_threads=-1,
+            filter=None):
+        """Run native Faiss HNSW search while hiding one node per query."""
+
+        selector = _selector_from_faiss_filter(filter)
+
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+
+        hidden = np.asarray(hide_labels, dtype=np.int64)
+        if hidden.ndim == 0:
+            if n != 1:
+                raise ValueError("Scalar hide_labels is only valid for a single query")
+            hidden = hidden.reshape(1)
+        else:
+            hidden = hidden.reshape(-1)
+        if hidden.shape[0] != n:
+            raise ValueError("hide_labels must have one label per query")
+
+        x = np.ascontiguousarray(x, dtype="float32")
+        hidden = np.ascontiguousarray(hidden, dtype=np.int64)
+        D = np.empty((n, k), dtype=np.float32)
+        I = np.empty((n, k), dtype=np.int64)
+
+        params = faiss.SearchParametersHNSW()
+        params.efSearch = int(self.hnsw.efSearch)
+        params.sel = selector
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.knn_query_hide_node_c(
+                n,
+                swig_ptr(x),
+                swig_ptr(hidden),
+                k,
+                swig_ptr(D),
+                swig_ptr(I),
+                params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return I, D
+
+    def replacement_compute_internal_lids(
+            self,
+            ids,
+            k_lid=15,
+            num_threads=-1,
+            filter=None):
+        """Compute native Faiss MLE-LID values for stored vector ids."""
+
+        selector = _selector_from_faiss_filter(filter)
+        ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+        ids = np.ascontiguousarray(ids, dtype=np.int64)
+        lids = np.empty(ids.shape[0], dtype=np.float32)
+
+        params = faiss.SearchParametersHNSW()
+        params.efSearch = int(self.hnsw.efSearch)
+        params.sel = selector
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.compute_internal_lids_c(
+                ids.shape[0],
+                swig_ptr(ids),
+                int(k_lid),
+                swig_ptr(lids),
+                params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return lids
+
+    def replacement_search_layer0_trace(
+            self,
+            x,
+            k=10,
+            ef=128,
+            hide_labels=None,
+            max_steps=0,
+            num_threads=-1,
+            filter=None):
+        """Return native Faiss level-0 trace arrays for SAGE calibration."""
+
+        selector = _selector_from_faiss_filter(filter)
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+        assert ef > 0
+
+        if hide_labels is None:
+            hidden = np.full(n, -1, dtype=np.int64)
+        else:
+            hidden = np.asarray(hide_labels, dtype=np.int64)
+            if hidden.ndim == 0:
+                if n != 1:
+                    raise ValueError("Scalar hide_labels is only valid for a single query")
+                hidden = hidden.reshape(1)
+            else:
+                hidden = hidden.reshape(-1)
+            if hidden.shape[0] != n:
+                raise ValueError("hide_labels must have one label per query")
+
+        x = np.ascontiguousarray(x, dtype="float32")
+        hidden = np.ascontiguousarray(hidden, dtype=np.int64)
+        base_max_steps = int(max_steps) if int(max_steps) > 0 else max(256, int(ef) * 4 + 64)
+        max_cells_per_chunk = 1_000_000
+
+        params = faiss.SearchParametersHNSW()
+        params.efSearch = int(ef)
+        params.sel = selector
+
+        def run_once(active_max_steps):
+            chunk_rows = max(1, min(n, max_cells_per_chunk // int(active_max_steps)))
+            chunks = []
+            for start in range(0, n, chunk_rows):
+                stop = min(start + chunk_rows, n)
+                rows = stop - start
+                shape = (rows, int(active_max_steps))
+                step_counts = np.zeros(rows, dtype=np.uint64)
+                truncated_flags = np.zeros(rows, dtype=np.uint64)
+                distance_counts = np.zeros(rows, dtype=np.uint64)
+                closest_dists = np.full(rows, np.inf, dtype=np.float32)
+                node_labels = np.full(shape, -1, dtype=np.int64)
+                rs_sizes = np.zeros(shape, dtype=np.uint64)
+                rs_sizes_after = np.zeros(shape, dtype=np.uint64)
+                is_full_pop_after = np.zeros(shape, dtype=np.uint64)
+                full_pop_counts_after = np.zeros(shape, dtype=np.uint64)
+                popped_degrees = np.zeros(shape, dtype=np.uint64)
+                unvisited_counts = np.zeros(shape, dtype=np.uint64)
+                accepted_counts = np.zeros(shape, dtype=np.uint64)
+                runtime_accepted_rates = np.full(shape, np.nan, dtype=np.float32)
+                runtime_cfrs = np.full(shape, np.nan, dtype=np.float32)
+                runtime_smoothed_cfrs = np.full(shape, np.nan, dtype=np.float32)
+                internal_dists = np.full(shape, np.nan, dtype=np.float32)
+                popped_query_dists = np.full(shape, np.nan, dtype=np.float32)
+                furthest_dists = np.full(shape, np.nan, dtype=np.float32)
+                best_dists = np.full(shape, np.nan, dtype=np.float32)
+                top_k_dists = np.full(shape, np.nan, dtype=np.float32)
+                ef_half_dists = np.full(shape, np.nan, dtype=np.float32)
+                ef_quarter_dists = np.full(shape, np.nan, dtype=np.float32)
+                sqrt_ef_dists = np.full(shape, np.nan, dtype=np.float32)
+                top_2k_dists = np.full(shape, np.nan, dtype=np.float32)
+                top_3k_dists = np.full(shape, np.nan, dtype=np.float32)
+
+                chunk_x = np.ascontiguousarray(x[start:stop], dtype="float32")
+                chunk_hidden = np.ascontiguousarray(hidden[start:stop], dtype=np.int64)
+                self.search_layer0_trace_c(
+                    rows,
+                    swig_ptr(chunk_x),
+                    int(k),
+                    int(ef),
+                    swig_ptr(chunk_hidden),
+                    int(active_max_steps),
+                    swig_ptr(step_counts),
+                    swig_ptr(truncated_flags),
+                    swig_ptr(distance_counts),
+                    swig_ptr(closest_dists),
+                    swig_ptr(node_labels),
+                    swig_ptr(rs_sizes),
+                    swig_ptr(rs_sizes_after),
+                    swig_ptr(is_full_pop_after),
+                    swig_ptr(full_pop_counts_after),
+                    swig_ptr(popped_degrees),
+                    swig_ptr(unvisited_counts),
+                    swig_ptr(accepted_counts),
+                    swig_ptr(runtime_accepted_rates),
+                    swig_ptr(runtime_cfrs),
+                    swig_ptr(runtime_smoothed_cfrs),
+                    swig_ptr(internal_dists),
+                    swig_ptr(popped_query_dists),
+                    swig_ptr(furthest_dists),
+                    swig_ptr(best_dists),
+                    swig_ptr(top_k_dists),
+                    swig_ptr(ef_half_dists),
+                    swig_ptr(ef_quarter_dists),
+                    swig_ptr(sqrt_ef_dists),
+                    swig_ptr(top_2k_dists),
+                    swig_ptr(top_3k_dists),
+                    params)
+                chunks.append({
+                    "step_counts": step_counts,
+                    "truncated_flags": truncated_flags,
+                    "distance_counts": distance_counts,
+                    "closest_dists": closest_dists,
+                    "node_labels": node_labels,
+                    "rs_sizes": rs_sizes,
+                    "rs_sizes_after": rs_sizes_after,
+                    "is_full_pop_after": is_full_pop_after,
+                    "full_pop_counts_after": full_pop_counts_after,
+                    "popped_degrees": popped_degrees,
+                    "unvisited_counts": unvisited_counts,
+                    "accepted_counts": accepted_counts,
+                    "runtime_accepted_rates": runtime_accepted_rates,
+                    "runtime_cfrs": runtime_cfrs,
+                    "runtime_smoothed_cfrs": runtime_smoothed_cfrs,
+                    "internal_dists": internal_dists,
+                    "popped_query_dists": popped_query_dists,
+                    "furthest_dists": furthest_dists,
+                    "best_dists": best_dists,
+                    "top_k_dists": top_k_dists,
+                    "ef_half_dists": ef_half_dists,
+                    "ef_quarter_dists": ef_quarter_dists,
+                    "sqrt_ef_dists": sqrt_ef_dists,
+                    "top_2k_dists": top_2k_dists,
+                    "top_3k_dists": top_3k_dists,
+                })
+            keys = chunks[0].keys()
+            return {key: np.concatenate([chunk[key] for chunk in chunks], axis=0) for key in keys}
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+        try:
+            active_max_steps = base_max_steps
+            for _ in range(8):
+                result = run_once(active_max_steps)
+                result["max_steps"] = int(active_max_steps)
+                if not np.any(result["truncated_flags"]):
+                    return result
+                active_max_steps *= 2
+            return result
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+    def replacement_search_layer0_chr_summary(
+            self,
+            x,
+            k=10,
+            ef=128,
+            hide_labels=None,
+            num_threads=-1,
+            filter=None):
+        """Return native Faiss per-query CHR window summaries for SAGE calibration."""
+
+        selector = _selector_from_faiss_filter(filter)
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+        assert ef > 0
+
+        if hide_labels is None:
+            hidden = np.full(n, -1, dtype=np.int64)
+        else:
+            hidden = np.asarray(hide_labels, dtype=np.int64)
+            if hidden.ndim == 0:
+                if n != 1:
+                    raise ValueError("Scalar hide_labels is only valid for a single query")
+                hidden = hidden.reshape(1)
+            else:
+                hidden = hidden.reshape(-1)
+            if hidden.shape[0] != n:
+                raise ValueError("hide_labels must have one label per query")
+
+        x = np.ascontiguousarray(x, dtype="float32")
+        hidden = np.ascontiguousarray(hidden, dtype=np.int64)
+        full_pop_counts = np.zeros(n, dtype=np.uint64)
+        window_obs_counts = np.zeros(n, dtype=np.uint64)
+        usable_flags = np.zeros(n, dtype=np.uint64)
+        distance_counts = np.zeros(n, dtype=np.uint64)
+        mean_smoothed_cfrs = np.full(n, np.nan, dtype=np.float32)
+        closest_dists = np.full(n, np.inf, dtype=np.float32)
+
+        params = faiss.SearchParametersHNSW()
+        params.efSearch = int(ef)
+        params.sel = selector
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.search_layer0_chr_summary_c(
+                n,
+                swig_ptr(x),
+                int(k),
+                int(ef),
+                swig_ptr(hidden),
+                swig_ptr(full_pop_counts),
+                swig_ptr(window_obs_counts),
+                swig_ptr(usable_flags),
+                swig_ptr(distance_counts),
+                swig_ptr(mean_smoothed_cfrs),
+                swig_ptr(closest_dists),
+                params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return {
+            "full_pop_counts": full_pop_counts,
+            "window_obs_counts": window_obs_counts,
+            "usable_flags": usable_flags,
+            "distance_counts": distance_counts,
+            "mean_smoothed_cfrs": mean_smoothed_cfrs,
+            "closest_dists": closest_dists,
+        }
+
+    def replacement_knn_query_beam_width_first_target_hit_step(
+            self,
+            x,
+            target_labels,
+            target_hits,
+            k=1,
+            ef_before=128,
+            switch_pop=0,
+            switch_full_pop=0,
+            ef_after=128,
+            num_threads=-1,
+            filter=None):
+        """Return the first pop step where the current top-k reaches target hits."""
+
+        selector = _selector_from_faiss_filter(filter)
+
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+
+        targets = np.asarray(target_labels)
+        if targets.ndim != 2 or targets.shape[0] != n:
+            raise ValueError("target_labels must have shape [num_queries, target_k]")
+        target_k = targets.shape[1]
+        targets = np.ascontiguousarray(targets, dtype=np.int64)
+
+        hits = np.asarray(target_hits)
+        if hits.ndim != 1 or hits.shape[0] != n:
+            raise ValueError("target_hits must have shape [num_queries]")
+        hits = np.ascontiguousarray(hits, dtype=np.uint64)
+
+        x = np.ascontiguousarray(x, dtype="float32")
+        first_steps = np.empty(n, dtype=np.uint64)
+        reached_flags = np.empty(n, dtype=np.uint64)
+        achieved_hits = np.empty(n, dtype=np.uint64)
+
+        params = faiss.SearchParametersHNSW()
+        params.sel = selector
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.knn_query_beam_width_first_target_hit_step_c(
+                n,
+                swig_ptr(x),
+                target_k,
+                swig_ptr(targets),
+                swig_ptr(hits),
+                k,
+                ef_before,
+                switch_pop,
+                switch_full_pop,
+                ef_after,
+                swig_ptr(first_steps),
+                swig_ptr(reached_flags),
+                swig_ptr(achieved_hits),
+                params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return (
+            first_steps,
+            reached_flags,
+            achieved_hits,
+            int(np.sum(reached_flags, dtype=np.uint64)),
+        )
 
     def replacement_search_and_reconstruct(self, x, k, *, params=None, D=None, I=None, R=None):
         """Find the k nearest neighbors of the set of vectors x in the index,
@@ -1025,9 +1425,20 @@ def handle_Index(the_class):
     replace_method(the_class, 'search', replacement_search)
     replace_method(the_class, 'knn_query_adaptive_light',
                    replacement_knn_query_adaptive_light, ignore_missing=True)
+    replace_method(the_class, 'knn_query_hide_node',
+                   replacement_knn_query_hide_node, ignore_missing=True)
+    replace_method(the_class, 'compute_internal_lids',
+                   replacement_compute_internal_lids, ignore_missing=True)
+    replace_method(the_class, 'search_layer0_trace',
+                   replacement_search_layer0_trace, ignore_missing=True)
+    replace_method(the_class, 'search_layer0_chr_summary',
+                   replacement_search_layer0_chr_summary, ignore_missing=True)
     if hasattr(the_class, "knn_query_adaptive_light_c"):
         setattr(the_class, "knn_query_adaptive_light_paper_bucket",
                 replacement_knn_query_adaptive_light_paper_bucket)
+    replace_method(the_class, 'knn_query_beam_width_first_target_hit_step',
+                   replacement_knn_query_beam_width_first_target_hit_step,
+                   ignore_missing=True)
     replace_method(the_class, 'remove_ids', replacement_remove_ids)
     replace_method(the_class, 'reconstruct', replacement_reconstruct)
     replace_method(the_class, 'reconstruct_batch',

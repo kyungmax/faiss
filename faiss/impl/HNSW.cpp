@@ -7,6 +7,7 @@
 
 #include <faiss/impl/HNSW.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cinttypes>
 #include <cstddef>
@@ -621,11 +622,11 @@ static inline void extract_search_params(
     }
 }
 
-static inline float raw_distance_to_hnswlib_distance(
+static inline float raw_distance_to_external_distance(
         float raw_distance,
         bool is_similarity_metric) {
-    // hnswlib uses 1 - similarity for IP/cosine, while Faiss internally
-    // traverses similarity HNSW with negated similarities.
+    // Convert Faiss internal similarity distances back to positive dissimilarity
+    // values for ratio-based stopping logic.
     return is_similarity_metric ? (1.0f + raw_distance) : raw_distance;
 }
 
@@ -688,13 +689,13 @@ static inline size_t resolve_paper_bucket_shrink_ef(
         size_t configured_ef,
         size_t k,
         const SearchParametersHNSWAdaptiveLight& params,
-        float classify_chr_ratio) {
+        float classify_cfr_ratio) {
     validate_paper_bucket_routing_config(params);
 
     const size_t bucket_count = static_cast<size_t>(params.paper_bucket_count);
     size_t selected_bucket_index = bucket_count - 1;
     for (size_t i = 0; i + 1 < bucket_count; i++) {
-        if (classify_chr_ratio <= get_bucket_gamma_ratio(params, i)) {
+        if (classify_cfr_ratio <= get_bucket_gamma_ratio(params, i)) {
             selected_bucket_index = i;
             break;
         }
@@ -709,6 +710,75 @@ static inline size_t resolve_paper_bucket_shrink_ef(
     routed_ef = std::max<size_t>(1, routed_ef);
     routed_ef = std::min(configured_ef, routed_ef);
     return std::max(routed_ef, k);
+}
+
+static inline void shrink_minimax_heap_capacity(
+        MinimaxHeap& candidates,
+        size_t new_capacity) {
+    const int new_n = static_cast<int>(std::max<size_t>(1, new_capacity));
+    if (new_n >= candidates.n) {
+        return;
+    }
+
+    candidates.n = new_n;
+    while (candidates.k > new_n) {
+        if (candidates.ids[0] != -1) {
+            --candidates.nvalid;
+        }
+        heap_pop<MinimaxHeap::HC>(
+                candidates.k--, candidates.dis.data(), candidates.ids.data());
+    }
+}
+
+static inline size_t count_target_hits_in_top_candidates(
+        const std::priority_queue<Node>& top_candidates,
+        size_t k,
+        const idx_t* target_labels,
+        size_t target_label_count) {
+    if (target_labels == nullptr || target_label_count == 0 ||
+        top_candidates.empty()) {
+        return 0;
+    }
+
+    auto snapshot = top_candidates;
+    std::vector<Node> sorted_candidates;
+    sorted_candidates.reserve(snapshot.size());
+    while (!snapshot.empty()) {
+        sorted_candidates.push_back(snapshot.top());
+        snapshot.pop();
+    }
+    std::sort(
+            sorted_candidates.begin(),
+            sorted_candidates.end(),
+            [](const Node& lhs, const Node& rhs) {
+                if (lhs.first != rhs.first) {
+                    return lhs.first < rhs.first;
+                }
+                return lhs.second < rhs.second;
+            });
+
+    const size_t limit = std::min(k, sorted_candidates.size());
+    size_t hit_count = 0;
+    for (size_t i = 0; i < limit; i++) {
+        const idx_t candidate_label = sorted_candidates[i].second;
+        for (size_t j = 0; j < target_label_count; j++) {
+            if (candidate_label == target_labels[j]) {
+                hit_count++;
+                break;
+            }
+        }
+    }
+    return hit_count;
+}
+
+static inline float prune_candidates_to_ef(
+        std::priority_queue<Node>& top_candidates,
+        size_t ef) {
+    while (top_candidates.size() > ef) {
+        top_candidates.pop();
+    }
+    return top_candidates.empty() ? std::numeric_limits<float>::max()
+                                  : top_candidates.top().first;
 }
 
 /** Do a BFS on the candidates list */
@@ -862,8 +932,8 @@ int search_from_candidates_adaptive_light(
     static constexpr size_t HARD_ONLY_STAG_LIMIT = 20;
     static constexpr int CLASSIFY_START = 4;
     static constexpr int CLASSIFY_END = 16;
-    static constexpr float CHR_EMA_DECAY = 0.8f;
-    static constexpr float CHR_EMA_UPDATE = 1.0f - CHR_EMA_DECAY;
+    static constexpr float CFR_EMA_DECAY = 0.8f;
+    static constexpr float CFR_EMA_UPDATE = 1.0f - CFR_EMA_DECAY;
 
     FAISS_THROW_IF_NOT_MSG(
             params.bounded_queue,
@@ -888,10 +958,10 @@ int search_from_candidates_adaptive_light(
     int full_pop_count = 0;
     int stagnation_count = 0;
     float prev_furthest = std::numeric_limits<float>::max();
-    float smoothed_chr_ema = std::numeric_limits<float>::quiet_NaN();
-    float classify_smoothed_chr_sum = 0.0f;
-    int classify_smoothed_chr_count = 0;
-    float classify_chr_mean = std::numeric_limits<float>::quiet_NaN();
+    float smoothed_cfr_ema = std::numeric_limits<float>::quiet_NaN();
+    float classify_smoothed_cfr_sum = 0.0f;
+    int classify_smoothed_cfr_count = 0;
+    float classify_cfr_mean = std::numeric_limits<float>::quiet_NaN();
     const bool direct_classifier_threshold_enabled =
             std::isfinite(params.early_stop_ratio);
     if (params.paper_bucket_mode) {
@@ -908,44 +978,42 @@ int search_from_candidates_adaptive_light(
             ? std::max(params.tmin_pops, CLASSIFY_END)
             : params.tmin_pops;
 
-    std::priority_queue<Node> top_candidates;
-    std::priority_queue<Node, std::vector<Node>, std::greater<Node>>
-            candidate_set;
-
-    float lower_bound = std::numeric_limits<float>::max();
-    candidate_set.emplace(d_nearest, nearest);
+    MinimaxHeap candidates(static_cast<int>(configured_ef_cur));
+    candidates.push(nearest, d_nearest);
     vt.set(nearest);
 
+    C::T threshold = res.threshold;
     if (!sel || sel->is_member(nearest)) {
-        top_candidates.emplace(d_nearest, nearest);
-        lower_bound = d_nearest;
+        if (d_nearest < threshold && res.add_result(d_nearest, nearest)) {
+            threshold = res.threshold;
+        }
     }
 
     int ndis = 0;
     int nstep = 0;
 
-    auto push_candidate = [&](idx_t idx, float dis) {
-        candidate_set.emplace(dis, idx);
+    auto add_to_heap = [&](const storage_idx_t idx, const float dis) {
         if (!sel || sel->is_member(idx)) {
-            top_candidates.emplace(dis, idx);
-            if (top_candidates.size() > ef_cur) {
-                top_candidates.pop();
-            }
-            if (!top_candidates.empty()) {
-                lower_bound = top_candidates.top().first;
+            if (dis < threshold) {
+                if (res.add_result(dis, idx)) {
+                    threshold = res.threshold;
+                }
             }
         }
+        candidates.push(idx, dis);
     };
 
-    while (!candidate_set.empty()) {
-        float candidate_dist = candidate_set.top().first;
-        storage_idx_t current = candidate_set.top().second;
-
-        if (candidate_dist > lower_bound && top_candidates.size() == ef_cur) {
+    while (candidates.size() > 0) {
+        float candidate_dist = 0.0f;
+        storage_idx_t current = candidates.pop_min(&candidate_dist);
+        if (current < 0) {
             break;
         }
 
-        candidate_set.pop();
+        if (candidates.count_below(candidate_dist) >=
+            static_cast<int>(ef_cur)) {
+            break;
+        }
 
         size_t begin, end;
         hnsw.neighbor_range(current, 0, &begin, &end);
@@ -981,10 +1049,7 @@ int search_from_candidates_adaptive_light(
                         dis[3]);
 
                 for (int id4 = 0; id4 < 4; id4++) {
-                    if (top_candidates.size() < ef_cur ||
-                        dis[id4] < lower_bound) {
-                        push_candidate(saved_j[id4], dis[id4]);
-                    }
+                    add_to_heap(saved_j[id4], dis[id4]);
                 }
 
                 ndis += 4;
@@ -994,58 +1059,55 @@ int search_from_candidates_adaptive_light(
 
         for (int icnt = 0; icnt < counter; icnt++) {
             float dis = qdis(saved_j[icnt]);
-            if (top_candidates.size() < ef_cur || dis < lower_bound) {
-                push_candidate(saved_j[icnt], dis);
-            }
+            add_to_heap(saved_j[icnt], dis);
             ndis += 1;
         }
 
         bool stop_search = false;
-        if (top_candidates.size() == ef_cur && !top_candidates.empty()) {
+        if (candidates.k >= static_cast<int>(ef_cur)) {
             full_pop_count++;
-            float furthest_dist = raw_distance_to_hnswlib_distance(
-                    top_candidates.top().first,
-                    similarity_metric);
-            const float candidate_dist_hnswlib =
-                    raw_distance_to_hnswlib_distance(
+            float furthest_dist = raw_distance_to_external_distance(
+                    candidates.max(), similarity_metric);
+            const float candidate_dist_external =
+                    raw_distance_to_external_distance(
                             candidate_dist,
                             similarity_metric);
-            const float chr =
-                    candidate_dist_hnswlib / std::max(furthest_dist, 1e-6f);
+            const float cfr =
+                    candidate_dist_external / std::max(furthest_dist, 1e-6f);
             bool rebased_after_shrink = false;
 
-            if (std::isnan(smoothed_chr_ema)) {
-                smoothed_chr_ema = chr;
+            if (std::isnan(smoothed_cfr_ema)) {
+                smoothed_cfr_ema = cfr;
             } else {
-                smoothed_chr_ema =
-                        CHR_EMA_DECAY * smoothed_chr_ema + CHR_EMA_UPDATE * chr;
+                smoothed_cfr_ema =
+                        CFR_EMA_DECAY * smoothed_cfr_ema + CFR_EMA_UPDATE * cfr;
             }
 
             if (full_pop_count >= CLASSIFY_START &&
                 full_pop_count <= CLASSIFY_END) {
-                classify_smoothed_chr_sum += smoothed_chr_ema;
-                classify_smoothed_chr_count++;
+                classify_smoothed_cfr_sum += smoothed_cfr_ema;
+                classify_smoothed_cfr_count++;
 
                 if (!classification_evaluated &&
                     full_pop_count == CLASSIFY_END) {
                     classification_evaluated = true;
                     if (direct_classifier_threshold_enabled) {
-                        classify_chr_mean = classify_smoothed_chr_sum /
-                                static_cast<float>(classify_smoothed_chr_count);
+                        classify_cfr_mean = classify_smoothed_cfr_sum /
+                                static_cast<float>(classify_smoothed_cfr_count);
                         is_easy_query =
-                                classify_chr_mean <= params.early_stop_ratio;
+                                classify_cfr_mean <= params.early_stop_ratio;
                         if (is_easy_query) {
-                            const float classify_chr_ratio =
-                                    classify_chr_mean /
+                            const float classify_cfr_ratio =
+                                    classify_cfr_mean /
                                     std::max(params.early_stop_ratio, 1e-6f);
                             if (super_easy_policy_enabled) {
                                 is_super_easy_query =
-                                        classify_chr_ratio <=
+                                        classify_cfr_ratio <=
                                         params.super_easy_gamma_ratio;
                             }
                             if (mid_easy_bucket_policy_enabled) {
                                 is_mid_easy_query =
-                                        classify_chr_ratio <=
+                                        classify_cfr_ratio <=
                                         params.mid_easy_upper_gamma_ratio;
                             }
                         }
@@ -1055,14 +1117,14 @@ int search_from_candidates_adaptive_light(
                         size_t shrunk_ef_cur = configured_ef_cur;
                         if (params.paper_bucket_mode) {
                             if (is_easy_query) {
-                                const float classify_chr_ratio =
-                                        classify_chr_mean /
+                                const float classify_cfr_ratio =
+                                        classify_cfr_mean /
                                         std::max(params.early_stop_ratio, 1e-6f);
                                 shrunk_ef_cur = resolve_paper_bucket_shrink_ef(
                                         configured_ef_cur,
                                         static_cast<size_t>(k_search),
                                         params,
-                                        classify_chr_ratio);
+                                        classify_cfr_ratio);
                             }
                         } else {
                             const size_t shrink_super_easy_ef =
@@ -1101,14 +1163,11 @@ int search_from_candidates_adaptive_light(
 
                         if (shrunk_ef_cur < ef_cur) {
                             ef_cur = shrunk_ef_cur;
-                            while (top_candidates.size() > ef_cur) {
-                                top_candidates.pop();
-                            }
-                            if (!top_candidates.empty()) {
-                                lower_bound = top_candidates.top().first;
+                            shrink_minimax_heap_capacity(candidates, ef_cur);
+                            if (candidates.k > 0) {
                                 furthest_dist =
-                                        raw_distance_to_hnswlib_distance(
-                                                top_candidates.top().first,
+                                        raw_distance_to_external_distance(
+                                                candidates.max(),
                                                 similarity_metric);
                             }
                             prev_furthest = furthest_dist;
@@ -1147,23 +1206,194 @@ int search_from_candidates_adaptive_light(
         }
     }
 
-    while (top_candidates.size() > static_cast<size_t>(k_search)) {
-        top_candidates.pop();
-    }
-
-    while (!top_candidates.empty()) {
-        res.add_result(top_candidates.top().first, top_candidates.top().second);
-        top_candidates.pop();
-    }
-
     stats.n1++;
-    if (candidate_set.empty()) {
+    if (candidates.size() == 0) {
         stats.n2++;
     }
     stats.ndis += ndis;
     stats.nhops += nstep;
 
     return 0;
+}
+
+HNSWTargetHitStats search_from_candidates_first_target_hit_step(
+        const HNSW& hnsw,
+        DistanceComputer& qdis,
+        HNSW::storage_idx_t nearest,
+        float d_nearest,
+        VisitedTable& vt,
+        idx_t k,
+        idx_t ef_before,
+        idx_t switch_pop,
+        idx_t switch_full_pop,
+        idx_t ef_after,
+        const idx_t* target_labels,
+        size_t target_label_count,
+        size_t target_hit_count,
+        const SearchParameters* params) {
+    HNSWTargetHitStats output;
+    output.target_hit_count = target_hit_count;
+    if (target_hit_count == 0) {
+        output.reached_target = 1;
+        return output;
+    }
+
+    const IDSelector* sel = params ? params->sel : nullptr;
+    const size_t normalized_k = std::max<size_t>(static_cast<size_t>(k), 1);
+    const size_t normalized_ef_before =
+            std::max<size_t>(static_cast<size_t>(ef_before), normalized_k);
+    const size_t normalized_ef_after =
+            std::max<size_t>(static_cast<size_t>(ef_after), normalized_k);
+    size_t ef_cur = normalized_ef_before;
+    bool phase_switch_applied = false;
+    size_t pop_count = 0;
+    size_t full_pop_count = 0;
+    int ndis = 0;
+
+    std::priority_queue<Node> top_candidates;
+    std::priority_queue<Node, std::vector<Node>, std::greater<Node>>
+            candidate_set;
+
+    float lower_bound = std::numeric_limits<float>::max();
+    candidate_set.emplace(d_nearest, nearest);
+    vt.set(nearest);
+    if (!sel || sel->is_member(nearest)) {
+        top_candidates.emplace(d_nearest, nearest);
+        lower_bound = d_nearest;
+    }
+
+    auto push_candidate = [&](idx_t idx, float dis) {
+        candidate_set.emplace(dis, idx);
+        if (!sel || sel->is_member(idx)) {
+            top_candidates.emplace(dis, idx);
+            if (top_candidates.size() > ef_cur) {
+                top_candidates.pop();
+            }
+            if (!top_candidates.empty()) {
+                lower_bound = top_candidates.top().first;
+            }
+        }
+    };
+
+    while (!candidate_set.empty()) {
+        float candidate_dist = candidate_set.top().first;
+        HNSW::storage_idx_t current = candidate_set.top().second;
+
+        if (candidate_dist > lower_bound && top_candidates.size() == ef_cur) {
+            break;
+        }
+
+        candidate_set.pop();
+        pop_count++;
+
+        size_t begin, end;
+        hnsw.neighbor_range(current, 0, &begin, &end);
+
+        size_t jmax = begin;
+        for (size_t j = begin; j < end; j++) {
+            int v1 = hnsw.neighbors[j];
+            if (v1 < 0) {
+                break;
+            }
+            vt.prefetch(v1);
+            jmax += 1;
+        }
+
+        int counter = 0;
+        HNSW::storage_idx_t saved_j[4];
+
+        for (size_t j = begin; j < jmax; j++) {
+            HNSW::storage_idx_t v1 = hnsw.neighbors[j];
+            saved_j[counter] = v1;
+            counter += vt.set(v1) ? 1 : 0;
+
+            if (counter == 4) {
+                float dis[4];
+                qdis.distances_batch_4(
+                        saved_j[0],
+                        saved_j[1],
+                        saved_j[2],
+                        saved_j[3],
+                        dis[0],
+                        dis[1],
+                        dis[2],
+                        dis[3]);
+
+                for (int id4 = 0; id4 < 4; id4++) {
+                    if (top_candidates.size() < ef_cur ||
+                        dis[id4] < lower_bound) {
+                        push_candidate(saved_j[id4], dis[id4]);
+                    }
+                }
+
+                ndis += 4;
+                counter = 0;
+            }
+        }
+
+        for (int icnt = 0; icnt < counter; icnt++) {
+            float dis = qdis(saved_j[icnt]);
+            if (top_candidates.size() < ef_cur || dis < lower_bound) {
+                push_candidate(saved_j[icnt], dis);
+            }
+            ndis += 1;
+        }
+
+        if (!phase_switch_applied && switch_pop > 0 &&
+            pop_count >= static_cast<size_t>(switch_pop)) {
+            phase_switch_applied = true;
+            const size_t prev_ef = ef_cur;
+            ef_cur = normalized_ef_after;
+            if (ef_cur < prev_ef) {
+                lower_bound = prune_candidates_to_ef(top_candidates, ef_cur);
+            }
+        }
+
+        if (top_candidates.size() == ef_cur) {
+            full_pop_count++;
+            if (!phase_switch_applied && switch_full_pop > 0 &&
+                full_pop_count >= static_cast<size_t>(switch_full_pop)) {
+                phase_switch_applied = true;
+                const size_t prev_ef = ef_cur;
+                ef_cur = normalized_ef_after;
+                if (ef_cur < prev_ef) {
+                    lower_bound =
+                            prune_candidates_to_ef(top_candidates, ef_cur);
+                }
+            }
+        }
+
+        const size_t current_hit_count = count_target_hits_in_top_candidates(
+                top_candidates,
+                normalized_k,
+                target_labels,
+                target_label_count);
+        output.achieved_hit_count =
+                std::max(output.achieved_hit_count, current_hit_count);
+        if (current_hit_count >= target_hit_count) {
+            output.first_target_hit_step = pop_count;
+            output.reached_target = 1;
+            break;
+        }
+    }
+
+    if (!output.reached_target) {
+        output.achieved_hit_count = std::max(
+                output.achieved_hit_count,
+                count_target_hits_in_top_candidates(
+                        top_candidates,
+                        normalized_k,
+                        target_labels,
+                        target_label_count));
+    }
+
+    output.search_stats.n1 = 1;
+    if (candidate_set.empty()) {
+        output.search_stats.n2 = 1;
+    }
+    output.search_stats.ndis = ndis;
+    output.search_stats.nhops = pop_count;
+    return output;
 }
 
 int search_from_candidates_panorama(
@@ -1717,7 +1947,6 @@ HNSWStats HNSW::search_adaptive_light(
 
     SearchParametersHNSWAdaptiveLight default_params;
     default_params.efSearch = this->efSearch;
-    default_params.check_relative_distance = this->check_relative_distance;
     default_params.bounded_queue = true;
     const SearchParametersHNSWAdaptiveLight* active_params =
             params ? params : &default_params;
@@ -1746,6 +1975,60 @@ HNSWStats HNSW::search_adaptive_light(
             *active_params);
 
     return stats;
+}
+
+HNSWTargetHitStats HNSW::search_first_target_hit_step(
+        DistanceComputer& qdis,
+        const IndexHNSW* index,
+        VisitedTable& vt,
+        idx_t k,
+        idx_t ef_before,
+        idx_t switch_pop,
+        idx_t switch_full_pop,
+        idx_t ef_after,
+        const idx_t* target_labels,
+        size_t target_label_count,
+        size_t target_hit_count,
+        const SearchParameters* params) const {
+    HNSWTargetHitStats output;
+    output.target_hit_count = target_hit_count;
+    if (target_hit_count == 0) {
+        output.reached_target = 1;
+        return output;
+    }
+    if (entry_point == -1) {
+        return output;
+    }
+
+    HNSWStats stats;
+    storage_idx_t nearest = entry_point;
+    float d_nearest = qdis(nearest);
+
+    for (int level = max_level; level >= 1; level--) {
+        HNSWStats local_stats =
+                greedy_update_nearest(*this, qdis, level, nearest, d_nearest);
+        stats.combine(local_stats);
+    }
+
+    output = search_from_candidates_first_target_hit_step(
+            *this,
+            qdis,
+            nearest,
+            d_nearest,
+            vt,
+            k,
+            ef_before,
+            switch_pop,
+            switch_full_pop,
+            ef_after,
+            target_labels,
+            target_label_count,
+            target_hit_count,
+            params);
+    output.search_stats.combine(stats);
+    vt.advance();
+    (void)index;
+    return output;
 }
 
 void HNSW::search_level_0(

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <vector>
 
@@ -84,6 +85,86 @@ struct IndexHNSW : Index {
             idx_t k,
             float* distances,
             idx_t* labels,
+            const SearchParameters* params = nullptr) const;
+
+    void knn_query_hide_node(
+            idx_t n,
+            const float* x,
+            const idx_t* hide_labels,
+            idx_t k,
+            float* distances,
+            idx_t* labels,
+            const SearchParameters* params = nullptr) const;
+
+    void compute_internal_lids(
+            idx_t n,
+            const idx_t* ids,
+            idx_t k_lid,
+            float* lids,
+            const SearchParameters* params = nullptr) const;
+
+    void search_layer0_trace(
+            idx_t n,
+            const float* x,
+            idx_t k,
+            idx_t ef,
+            const idx_t* hide_labels,
+            idx_t max_steps,
+            uint64_t* step_counts,
+            uint64_t* truncated_flags,
+            uint64_t* distance_counts,
+            float* closest_dists,
+            idx_t* node_labels,
+            uint64_t* rs_sizes,
+            uint64_t* rs_sizes_after,
+            uint64_t* is_full_pop_after,
+            uint64_t* full_pop_counts_after,
+            uint64_t* popped_degrees,
+            uint64_t* unvisited_counts,
+            uint64_t* accepted_counts,
+            float* runtime_accepted_rates,
+            float* runtime_cfrs,
+            float* runtime_smoothed_cfrs,
+            float* internal_dists,
+            float* popped_query_dists,
+            float* furthest_dists,
+            float* best_dists,
+            float* top_k_dists,
+            float* ef_half_dists,
+            float* ef_quarter_dists,
+            float* sqrt_ef_dists,
+            float* top_2k_dists,
+            float* top_3k_dists,
+            const SearchParameters* params = nullptr) const;
+
+    void search_layer0_chr_summary(
+            idx_t n,
+            const float* x,
+            idx_t k,
+            idx_t ef,
+            const idx_t* hide_labels,
+            uint64_t* full_pop_counts,
+            uint64_t* window_obs_counts,
+            uint64_t* usable_flags,
+            uint64_t* distance_counts,
+            float* mean_smoothed_cfrs,
+            float* closest_dists,
+            const SearchParameters* params = nullptr) const;
+
+    void knn_query_beam_width_first_target_hit_step(
+            idx_t n,
+            const float* x,
+            idx_t target_k,
+            const idx_t* target_labels,
+            const uint64_t* target_hits,
+            idx_t k,
+            idx_t ef_before,
+            idx_t switch_pop,
+            idx_t switch_full_pop,
+            idx_t ef_after,
+            uint64_t* first_steps,
+            uint64_t* reached_flags,
+            uint64_t* achieved_hits,
             const SearchParameters* params = nullptr) const;
 
     void range_search(

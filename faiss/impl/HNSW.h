@@ -48,6 +48,7 @@ class LockVector;
 struct VisitedTable;
 struct DistanceComputer; // from AuxIndexStructures
 struct HNSWStats;
+struct HNSWTargetHitStats;
 
 struct SearchParametersHNSW : SearchParameters {
     int efSearch = 16;
@@ -225,6 +226,20 @@ struct HNSW {
             VisitedTable& vt,
             const SearchParametersHNSWAdaptiveLight* params = nullptr) const;
 
+    HNSWTargetHitStats search_first_target_hit_step(
+            DistanceComputer& qdis,
+            const IndexHNSW* index,
+            VisitedTable& vt,
+            idx_t k,
+            idx_t ef_before,
+            idx_t switch_pop,
+            idx_t switch_full_pop,
+            idx_t ef_after,
+            const idx_t* target_labels,
+            size_t target_label_count,
+            size_t target_hit_count,
+            const SearchParameters* params = nullptr) const;
+
     /// search only in level 0 from a given vertex
     void search_level_0(
             DistanceComputer& qdis,
@@ -277,6 +292,14 @@ struct HNSWStats {
 
 // global var that collects them all
 FAISS_API extern HNSWStats hnsw_stats;
+
+struct HNSWTargetHitStats {
+    size_t first_target_hit_step = 0;
+    size_t target_hit_count = 0;
+    size_t achieved_hit_count = 0;
+    size_t reached_target = 0;
+    HNSWStats search_stats;
+};
 
 int search_from_candidates(
         const HNSW& hnsw,

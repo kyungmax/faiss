@@ -8,6 +8,7 @@
 #include <faiss/IndexHNSW.h>
 
 #include <omp.h>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cinttypes>
@@ -55,6 +56,510 @@ DistanceComputer* storage_distance_computer(const Index* storage) {
         return storage->get_distance_computer();
     }
 }
+
+static inline float sage_external_distance(
+        float raw_distance,
+        bool similarity_metric) {
+    return similarity_metric ? (1.0f + raw_distance) : raw_distance;
+}
+
+static inline float sage_rank_distance_or_nan(
+        const std::priority_queue<HNSW::Node>& top_candidates,
+        size_t rank,
+        bool similarity_metric) {
+    if (rank == 0 || top_candidates.size() < rank) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    auto snapshot = top_candidates;
+    std::vector<HNSW::Node> sorted;
+    sorted.reserve(snapshot.size());
+    while (!snapshot.empty()) {
+        sorted.push_back(snapshot.top());
+        snapshot.pop();
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const HNSW::Node& a, const HNSW::Node& b) {
+        if (a.first != b.first) {
+            return a.first < b.first;
+        }
+        return a.second < b.second;
+    });
+    return sage_external_distance(sorted[rank - 1].first, similarity_metric);
+}
+
+static inline HNSW::storage_idx_t sage_resolve_entry_point(
+        const IndexHNSW& index,
+        idx_t hidden_label) {
+    const HNSW& hnsw = index.hnsw;
+    if (index.ntotal <= 0 || hnsw.entry_point < 0) {
+        return -1;
+    }
+    if (hidden_label < 0 || hnsw.entry_point != hidden_label) {
+        return hnsw.entry_point;
+    }
+
+    HNSW::storage_idx_t fallback = -1;
+    int fallback_level = -1;
+    for (idx_t i = 0; i < index.ntotal; i++) {
+        if (i == hidden_label) {
+            continue;
+        }
+        const int level = hnsw.levels[i];
+        if (level > fallback_level) {
+            fallback = static_cast<HNSW::storage_idx_t>(i);
+            fallback_level = level;
+        }
+    }
+    return fallback;
+}
+
+static inline size_t sage_greedy_update_nearest_hidden(
+        const HNSW& hnsw,
+        DistanceComputer& qdis,
+        int level,
+        HNSW::storage_idx_t& nearest,
+        float& d_nearest,
+        idx_t hidden_label) {
+    size_t ndis = 0;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        size_t begin = 0, end = 0;
+        hnsw.neighbor_range(nearest, level, &begin, &end);
+        for (size_t j = begin; j < end; j++) {
+            HNSW::storage_idx_t v = hnsw.neighbors[j];
+            if (v < 0) {
+                break;
+            }
+            if (v == hidden_label) {
+                continue;
+            }
+            float dis = qdis(v);
+            ndis++;
+            if (dis < d_nearest) {
+                nearest = v;
+                d_nearest = dis;
+                changed = true;
+            }
+        }
+    }
+    return ndis;
+}
+
+struct SageEntryPointResult {
+    HNSW::storage_idx_t nearest = -1;
+    float distance = std::numeric_limits<float>::infinity();
+    size_t distance_count = 0;
+};
+
+static SageEntryPointResult sage_resolve_search_entry_hidden(
+        const IndexHNSW& index,
+        DistanceComputer& qdis,
+        idx_t hidden_label) {
+    SageEntryPointResult result;
+    const HNSW& hnsw = index.hnsw;
+    result.nearest = sage_resolve_entry_point(index, hidden_label);
+    if (result.nearest < 0 || result.nearest == hidden_label) {
+        return result;
+    }
+
+    result.distance = qdis(result.nearest);
+    result.distance_count = 1;
+    int start_level = hnsw.max_level;
+    if (result.nearest != hnsw.entry_point) {
+        start_level = std::min(
+                start_level,
+                std::max(0, hnsw.levels[result.nearest] - 1));
+    }
+    for (int level = start_level; level >= 1; level--) {
+        result.distance_count += sage_greedy_update_nearest_hidden(
+                hnsw,
+                qdis,
+                level,
+                result.nearest,
+                result.distance,
+                hidden_label);
+    }
+    return result;
+}
+
+struct SageTraceOutputs {
+    idx_t max_steps = 0;
+    uint64_t* step_counts = nullptr;
+    uint64_t* truncated_flags = nullptr;
+    uint64_t* distance_counts = nullptr;
+    float* closest_dists = nullptr;
+    idx_t* node_labels = nullptr;
+    uint64_t* rs_sizes = nullptr;
+    uint64_t* rs_sizes_after = nullptr;
+    uint64_t* is_full_pop_after = nullptr;
+    uint64_t* full_pop_counts_after = nullptr;
+    uint64_t* popped_degrees = nullptr;
+    uint64_t* unvisited_counts = nullptr;
+    uint64_t* accepted_counts = nullptr;
+    float* runtime_accepted_rates = nullptr;
+    float* runtime_cfrs = nullptr;
+    float* runtime_smoothed_cfrs = nullptr;
+    float* internal_dists = nullptr;
+    float* popped_query_dists = nullptr;
+    float* furthest_dists = nullptr;
+    float* best_dists = nullptr;
+    float* top_k_dists = nullptr;
+    float* ef_half_dists = nullptr;
+    float* ef_quarter_dists = nullptr;
+    float* sqrt_ef_dists = nullptr;
+    float* top_2k_dists = nullptr;
+    float* top_3k_dists = nullptr;
+};
+
+struct SageLevel0SearchResult {
+    size_t distance_count = 0;
+    size_t hop_count = 0;
+    bool exhausted = false;
+    bool truncated = false;
+    size_t stored_steps = 0;
+    size_t full_pop_count = 0;
+    size_t window_obs_count = 0;
+    float mean_smoothed_cfr_classify_window =
+            std::numeric_limits<float>::quiet_NaN();
+    bool usable_for_mean_window = false;
+    float closest_dist = std::numeric_limits<float>::infinity();
+};
+
+static SageLevel0SearchResult sage_search_level0_hidden(
+        const IndexHNSW& index,
+        DistanceComputer& qdis,
+        VisitedTable& vt,
+        HNSW::storage_idx_t nearest,
+        float d_nearest,
+        idx_t k,
+        idx_t ef,
+        idx_t hidden_label,
+        bool similarity_metric,
+        const SearchParameters* params,
+        float* out_distances,
+        idx_t* out_labels,
+        SageTraceOutputs* trace,
+        idx_t trace_row) {
+    SageLevel0SearchResult result;
+    const HNSW& hnsw = index.hnsw;
+    const IDSelector* sel = params ? params->sel : nullptr;
+    const size_t normalized_k = std::max<size_t>(static_cast<size_t>(k), 1);
+    const size_t ef_search = std::max<size_t>(static_cast<size_t>(ef), normalized_k);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+
+    std::priority_queue<HNSW::Node> top_candidates;
+    std::priority_queue<HNSW::Node, std::vector<HNSW::Node>, std::greater<HNSW::Node>>
+            candidate_set;
+
+    if (hidden_label >= 0 && hidden_label < index.ntotal) {
+        vt.set(static_cast<HNSW::storage_idx_t>(hidden_label));
+    }
+    vt.set(nearest);
+    candidate_set.emplace(d_nearest, nearest);
+    if (!sel || sel->is_member(nearest)) {
+        top_candidates.emplace(d_nearest, nearest);
+    }
+
+    float best_raw_distance = d_nearest;
+    float smoothed_cfr_ema = nan;
+    size_t full_pop_count = 0;
+    size_t stored_steps = 0;
+    double classify_window_sum = 0.0;
+    size_t classify_window_count = 0;
+    bool truncated = false;
+
+    while (!candidate_set.empty()) {
+        const float candidate_distance = candidate_set.top().first;
+        const HNSW::storage_idx_t current = candidate_set.top().second;
+        const float current_lower_bound = top_candidates.empty()
+                ? std::numeric_limits<float>::max()
+                : top_candidates.top().first;
+        if (top_candidates.size() == ef_search &&
+            candidate_distance > current_lower_bound) {
+            break;
+        }
+
+        candidate_set.pop();
+        result.hop_count++;
+
+        const size_t rs_size_before = top_candidates.size();
+        const float raw_internal_before = current_lower_bound;
+        size_t begin = 0, end = 0;
+        hnsw.neighbor_range(current, 0, &begin, &end);
+
+        size_t popped_degree = 0;
+        size_t unvisited_count = 0;
+        size_t accepted_count = 0;
+        float lower_bound = current_lower_bound;
+
+        for (size_t j = begin; j < end; j++) {
+            const HNSW::storage_idx_t v = hnsw.neighbors[j];
+            if (v < 0) {
+                break;
+            }
+            if (v == hidden_label) {
+                continue;
+            }
+            popped_degree++;
+            if (!vt.set(v)) {
+                continue;
+            }
+            unvisited_count++;
+            const float dis = qdis(v);
+            result.distance_count++;
+            if (top_candidates.size() < ef_search || dis < lower_bound) {
+                candidate_set.emplace(dis, v);
+                accepted_count++;
+                if (!sel || sel->is_member(v)) {
+                    top_candidates.emplace(dis, v);
+                    if (top_candidates.size() > ef_search) {
+                        top_candidates.pop();
+                    }
+                    if (!top_candidates.empty()) {
+                        lower_bound = top_candidates.top().first;
+                    }
+                }
+                if (dis < best_raw_distance) {
+                    best_raw_distance = dis;
+                }
+            }
+        }
+
+        const size_t rs_size_after = top_candidates.size();
+        const bool is_full = rs_size_after == ef_search;
+        float runtime_accepted_rate = nan;
+        float runtime_cfr = nan;
+        float runtime_smoothed_cfr = nan;
+        size_t full_pop_count_after = 0;
+        const float furthest_raw_distance = top_candidates.empty() ? nan : top_candidates.top().first;
+        const float furthest_dist = sage_external_distance(furthest_raw_distance, similarity_metric);
+        const float popped_query_dist = sage_external_distance(candidate_distance, similarity_metric);
+        const float best_dist = sage_external_distance(best_raw_distance, similarity_metric);
+        const float internal_dist = sage_external_distance(raw_internal_before, similarity_metric);
+
+        if (is_full) {
+            full_pop_count++;
+            full_pop_count_after = full_pop_count;
+            runtime_accepted_rate = unvisited_count > 0
+                    ? static_cast<float>(accepted_count) / static_cast<float>(unvisited_count)
+                    : 0.0f;
+            if (std::isfinite(furthest_dist) && std::fabs(furthest_dist) > 1e-6f) {
+                runtime_cfr = popped_query_dist / std::max(furthest_dist, 1e-6f);
+                if (std::isnan(smoothed_cfr_ema)) {
+                    smoothed_cfr_ema = runtime_cfr;
+                } else {
+                    smoothed_cfr_ema = 0.8f * smoothed_cfr_ema + 0.2f * runtime_cfr;
+                }
+                runtime_smoothed_cfr = smoothed_cfr_ema;
+            }
+            if (full_pop_count >= 4 && full_pop_count <= 16 &&
+                std::isfinite(runtime_smoothed_cfr)) {
+                classify_window_sum += static_cast<double>(runtime_smoothed_cfr);
+                classify_window_count++;
+            }
+        }
+
+        if (trace) {
+            if (stored_steps < static_cast<size_t>(trace->max_steps)) {
+                const size_t pos = static_cast<size_t>(trace_row) * static_cast<size_t>(trace->max_steps) + stored_steps;
+                trace->node_labels[pos] = current;
+                trace->rs_sizes[pos] = static_cast<uint64_t>(rs_size_before);
+                trace->rs_sizes_after[pos] = static_cast<uint64_t>(rs_size_after);
+                trace->is_full_pop_after[pos] = is_full ? 1 : 0;
+                trace->full_pop_counts_after[pos] = static_cast<uint64_t>(full_pop_count_after);
+                trace->popped_degrees[pos] = static_cast<uint64_t>(popped_degree);
+                trace->unvisited_counts[pos] = static_cast<uint64_t>(unvisited_count);
+                trace->accepted_counts[pos] = static_cast<uint64_t>(accepted_count);
+                trace->runtime_accepted_rates[pos] = runtime_accepted_rate;
+                trace->runtime_cfrs[pos] = runtime_cfr;
+                trace->runtime_smoothed_cfrs[pos] = runtime_smoothed_cfr;
+                trace->internal_dists[pos] = internal_dist;
+                trace->popped_query_dists[pos] = popped_query_dist;
+                trace->furthest_dists[pos] = furthest_dist;
+                trace->best_dists[pos] = best_dist;
+                trace->top_k_dists[pos] = sage_rank_distance_or_nan(
+                        top_candidates, normalized_k, similarity_metric);
+                trace->ef_half_dists[pos] = sage_rank_distance_or_nan(
+                        top_candidates, std::max<size_t>(1, ef_search / 2), similarity_metric);
+                trace->ef_quarter_dists[pos] = sage_rank_distance_or_nan(
+                        top_candidates, std::max<size_t>(1, ef_search / 4), similarity_metric);
+                trace->sqrt_ef_dists[pos] = sage_rank_distance_or_nan(
+                        top_candidates,
+                        std::max<size_t>(1, static_cast<size_t>(std::sqrt(static_cast<double>(ef_search)))),
+                        similarity_metric);
+                trace->top_2k_dists[pos] = sage_rank_distance_or_nan(
+                        top_candidates, normalized_k * 2, similarity_metric);
+                trace->top_3k_dists[pos] = sage_rank_distance_or_nan(
+                        top_candidates, normalized_k * 3, similarity_metric);
+                stored_steps++;
+            } else {
+                truncated = true;
+            }
+        }
+    }
+
+    result.exhausted = candidate_set.empty();
+    result.truncated = truncated;
+    result.stored_steps = stored_steps;
+    result.full_pop_count = full_pop_count;
+    result.window_obs_count = classify_window_count;
+    if (classify_window_count > 0) {
+        result.mean_smoothed_cfr_classify_window = static_cast<float>(
+                classify_window_sum / static_cast<double>(classify_window_count));
+    }
+    result.usable_for_mean_window = full_pop_count >= 16 &&
+            std::isfinite(result.mean_smoothed_cfr_classify_window);
+    result.closest_dist = sage_external_distance(best_raw_distance, similarity_metric);
+
+    if (out_distances && out_labels) {
+        std::vector<HNSW::Node> sorted;
+        sorted.reserve(top_candidates.size());
+        while (!top_candidates.empty()) {
+            sorted.push_back(top_candidates.top());
+            top_candidates.pop();
+        }
+        std::sort(sorted.begin(), sorted.end(), [](const HNSW::Node& a, const HNSW::Node& b) {
+            if (a.first != b.first) {
+                return a.first < b.first;
+            }
+            return a.second < b.second;
+        });
+        for (size_t i = 0; i < normalized_k; i++) {
+            if (i < sorted.size()) {
+                out_distances[i] = sage_external_distance(sorted[i].first, similarity_metric);
+                out_labels[i] = sorted[i].second;
+            } else {
+                out_distances[i] = std::numeric_limits<float>::infinity();
+                out_labels[i] = -1;
+            }
+        }
+    }
+
+    return result;
+}
+
+struct SageLidSearchResult {
+    size_t distance_count = 0;
+    size_t hop_count = 0;
+    std::vector<float> distances;
+};
+
+static SageLidSearchResult sage_search_level0_lid_hnswlib_style(
+        const IndexHNSW& index,
+        DistanceComputer& qdis,
+        VisitedTable& vt,
+        HNSW::storage_idx_t entry,
+        float entry_distance,
+        idx_t ef,
+        bool similarity_metric) {
+    SageLidSearchResult result;
+    const HNSW& hnsw = index.hnsw;
+    const size_t ef_search = std::max<size_t>(static_cast<size_t>(ef), 1);
+
+    std::priority_queue<HNSW::Node> top_candidates;
+    std::priority_queue<HNSW::Node, std::vector<HNSW::Node>, std::greater<HNSW::Node>>
+            candidate_set;
+
+    vt.set(entry);
+    top_candidates.emplace(entry_distance, entry);
+    candidate_set.emplace(entry_distance, entry);
+
+    while (!candidate_set.empty()) {
+        const float candidate_distance = candidate_set.top().first;
+        const float lower_bound = top_candidates.empty()
+                ? std::numeric_limits<float>::max()
+                : top_candidates.top().first;
+
+        // Match hnswlib searchBaseLayerST<true>: bare-bone search stops on
+        // candidate_dist > lowerBound, without requiring top_candidates == ef.
+        if (candidate_distance > lower_bound) {
+            break;
+        }
+
+        const HNSW::storage_idx_t current = candidate_set.top().second;
+        candidate_set.pop();
+        result.hop_count++;
+
+        size_t begin = 0, end = 0;
+        hnsw.neighbor_range(current, 0, &begin, &end);
+        float mutable_lower_bound = lower_bound;
+        for (size_t j = begin; j < end; j++) {
+            const HNSW::storage_idx_t v = hnsw.neighbors[j];
+            if (v < 0) {
+                break;
+            }
+            if (!vt.set(v)) {
+                continue;
+            }
+            const float dis = qdis(v);
+            result.distance_count++;
+
+            if (top_candidates.size() < ef_search || mutable_lower_bound > dis) {
+                candidate_set.emplace(dis, v);
+                top_candidates.emplace(dis, v);
+                while (top_candidates.size() > ef_search) {
+                    top_candidates.pop();
+                }
+                if (!top_candidates.empty()) {
+                    mutable_lower_bound = top_candidates.top().first;
+                }
+            }
+        }
+    }
+
+    result.distances.reserve(top_candidates.size());
+    while (!top_candidates.empty()) {
+        result.distances.push_back(
+                sage_external_distance(top_candidates.top().first, similarity_metric));
+        top_candidates.pop();
+    }
+    std::sort(result.distances.begin(), result.distances.end());
+    return result;
+}
+
+static float sage_mle_lid_hnswlib_style(
+        const std::vector<float>& sorted_distances,
+        idx_t k_lid) {
+    if (k_lid < 2) {
+        return 0.0f;
+    }
+
+    float d_max = 0.0f;
+    size_t actual_k = 0;
+    for (float distance : sorted_distances) {
+        if (!std::isfinite(distance) || distance <= 1e-9f) {
+            continue;
+        }
+        actual_k++;
+        d_max = distance;
+        if (actual_k >= static_cast<size_t>(k_lid)) {
+            break;
+        }
+    }
+
+    if (actual_k < 2 || d_max <= 1e-9f) {
+        return 0.0f;
+    }
+
+    double sum_log = 0.0;
+    size_t valid_k = 0;
+    for (float distance : sorted_distances) {
+        if (!std::isfinite(distance) || distance <= 1e-9f) {
+            continue;
+        }
+        sum_log += std::log(static_cast<double>(distance / d_max));
+        valid_k++;
+        if (valid_k >= actual_k) {
+            break;
+        }
+    }
+
+    if (sum_log != 0.0) {
+        return static_cast<float>(-static_cast<double>(valid_k) / sum_log);
+    }
+    return 0.0f;
+}
+
 
 void hnsw_add_vertices(
         IndexHNSW& index_hnsw,
@@ -330,7 +835,6 @@ void hnsw_search_adaptive_light(
     const HNSW& hnsw = index->hnsw;
     SearchParametersHNSWAdaptiveLight default_params;
     default_params.efSearch = hnsw.efSearch;
-    default_params.check_relative_distance = hnsw.check_relative_distance;
     default_params.bounded_queue = true;
 
     const SearchParametersHNSWAdaptiveLight* params = &default_params;
@@ -368,7 +872,14 @@ void hnsw_search_adaptive_light(
                 omp_capture_exception(ex, [&] { interrupt = true; });
             }
 
-#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(guided)
+            // adaptive-light query cost is bimodal: easy queries early-stop
+            // cheaply while hard queries run long. guided hands out large
+            // initial chunks, so a thread that draws a chunk full of hard
+            // queries becomes a straggler while the rest idle, capping
+            // multi-thread scaling at ~80-90% efficiency. dynamic spreads the
+            // hard queries across threads; per-query work (>= CLASSIFY_END full
+            // pops) dwarfs the scheduler's atomic overhead.
+#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(dynamic)
             for (idx_t i = i0; i < i1; i++) {
                 if (interrupt.load(std::memory_order_relaxed)) {
                     continue;
@@ -444,6 +955,566 @@ void IndexHNSW::knn_query_adaptive_light(
             }
         }
     }
+}
+
+void IndexHNSW::knn_query_hide_node(
+        idx_t n,
+        const float* x,
+        const idx_t* hide_labels,
+        idx_t k,
+        float* distances,
+        idx_t* labels,
+        const SearchParameters* params) const {
+    FAISS_THROW_IF_NOT_MSG(
+            storage,
+            "No storage index, please use IndexHNSWFlat (or variants) "
+            "instead of IndexHNSW directly");
+    FAISS_THROW_IF_NOT(k > 0);
+    FAISS_THROW_IF_NOT(x);
+    FAISS_THROW_IF_NOT(hide_labels);
+    FAISS_THROW_IF_NOT(distances);
+    FAISS_THROW_IF_NOT(labels);
+
+    const bool similarity_metric = is_similarity_metric(this->metric_type);
+    const HNSW& hnsw = this->hnsw;
+    size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
+    idx_t check_period = InterruptCallback::get_period_hint(
+            std::max<int>(hnsw.max_level, 1) * this->d * std::max<idx_t>(k, 1));
+
+    for (idx_t i0 = 0; i0 < n; i0 += check_period) {
+        idx_t i1 = std::min(i0 + check_period, n);
+        std::exception_ptr ex;
+        std::atomic<bool> interrupt{false};
+
+#pragma omp parallel if (i1 - i0 > 1)
+        {
+            std::unique_ptr<VisitedTable> vt;
+            std::unique_ptr<DistanceComputer> dis;
+            try {
+                vt = std::make_unique<VisitedTable>(
+                        this->ntotal, hnsw.use_visited_hashset);
+                dis.reset(storage_distance_computer(this->storage));
+            } catch (...) {
+                omp_capture_exception(ex, [&] { interrupt = true; });
+            }
+
+            // bimodal per-query cost (see knn_query_adaptive_light): dynamic
+            // avoids the straggler imbalance that guided causes here.
+#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(dynamic)
+            for (idx_t i = i0; i < i1; i++) {
+                if (interrupt.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                try {
+                    float* row_distances = distances + i * k;
+                    idx_t* row_labels = labels + i * k;
+                    for (idx_t j = 0; j < k; j++) {
+                        row_distances[j] = std::numeric_limits<float>::infinity();
+                        row_labels[j] = -1;
+                    }
+
+                    dis->set_query(x + i * this->d);
+                    SageEntryPointResult entry = sage_resolve_search_entry_hidden(
+                            *this, *dis, hide_labels[i]);
+                    if (entry.nearest >= 0) {
+                        SageLevel0SearchResult stats = sage_search_level0_hidden(
+                                *this,
+                                *dis,
+                                *vt,
+                                entry.nearest,
+                                entry.distance,
+                                k,
+                                std::max<idx_t>(hnsw.efSearch, k),
+                                hide_labels[i],
+                                similarity_metric,
+                                params,
+                                row_distances,
+                                row_labels,
+                                nullptr,
+                                i);
+                        n1 += 1;
+                        n2 += stats.exhausted ? 1 : 0;
+                        ndis += entry.distance_count + stats.distance_count;
+                        nhops += stats.hop_count;
+                    }
+                    vt->advance();
+                } catch (...) {
+                    omp_capture_exception(ex, [&] { interrupt = true; });
+                }
+            }
+        }
+        omp_rethrow_if_exception(ex);
+        InterruptCallback::check();
+    }
+
+    hnsw_stats.combine({n1, n2, ndis, nhops});
+}
+
+void IndexHNSW::compute_internal_lids(
+        idx_t n,
+        const idx_t* ids,
+        idx_t k_lid,
+        float* lids,
+        const SearchParameters* params) const {
+    FAISS_THROW_IF_NOT_MSG(
+            storage,
+            "No storage index, please use IndexHNSWFlat (or variants) "
+            "instead of IndexHNSW directly");
+    FAISS_THROW_IF_NOT(k_lid > 0);
+    FAISS_THROW_IF_NOT(ids);
+    FAISS_THROW_IF_NOT(lids);
+    (void)params;
+
+    const bool similarity_metric = is_similarity_metric(this->metric_type);
+    const HNSW& hnsw = this->hnsw;
+    if (this->ntotal <= 0 || hnsw.entry_point < 0) {
+        for (idx_t i = 0; i < n; i++) {
+            lids[i] = 0.0f;
+        }
+        return;
+    }
+
+    // Match hnswlib calcNodeLidValueInternal(): searchBaseLayerST<true>(
+    // enterpoint_node_, query_data, max(default ef_=10, k_lid + 1)).  FAISS
+    // DARTH indexes often persist efSearch=1000, so do not reuse hnsw.efSearch
+    // here; otherwise offline LID cost and buckets no longer correspond to the
+    // hnswlib SAGE pipeline.
+    const idx_t lid_ef = std::max<idx_t>(10, k_lid + 1);
+
+    size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
+    idx_t check_period = InterruptCallback::get_period_hint(
+            std::max<int>(hnsw.max_level, 1) * this->d * std::max<idx_t>(lid_ef, 1));
+
+    for (idx_t i0 = 0; i0 < n; i0 += check_period) {
+        idx_t i1 = std::min(i0 + check_period, n);
+        std::exception_ptr ex;
+        std::atomic<bool> interrupt{false};
+
+#pragma omp parallel if (i1 - i0 > 1)
+        {
+            std::unique_ptr<VisitedTable> vt;
+            std::unique_ptr<DistanceComputer> dis;
+            std::vector<float> query(this->d);
+            try {
+                vt = std::make_unique<VisitedTable>(
+                        this->ntotal, hnsw.use_visited_hashset);
+                dis.reset(storage_distance_computer(this->storage));
+            } catch (...) {
+                omp_capture_exception(ex, [&] { interrupt = true; });
+            }
+
+#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(guided)
+            for (idx_t i = i0; i < i1; i++) {
+                if (interrupt.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                try {
+                    const idx_t query_id = ids[i];
+                    lids[i] = 0.0f;
+                    if (query_id < 0 || query_id >= this->ntotal) {
+                        continue;
+                    }
+
+                    storage->reconstruct(query_id, query.data());
+                    dis->set_query(query.data());
+                    const HNSW::storage_idx_t entry = hnsw.entry_point;
+                    const float entry_distance = (*dis)(entry);
+                    SageLidSearchResult stats = sage_search_level0_lid_hnswlib_style(
+                            *this,
+                            *dis,
+                            *vt,
+                            entry,
+                            entry_distance,
+                            lid_ef,
+                            similarity_metric);
+
+                    n1 += 1;
+                    ndis += 1 + stats.distance_count;
+                    nhops += stats.hop_count;
+                    lids[i] = sage_mle_lid_hnswlib_style(stats.distances, k_lid);
+                    vt->advance();
+                } catch (...) {
+                    omp_capture_exception(ex, [&] { interrupt = true; });
+                }
+            }
+        }
+        omp_rethrow_if_exception(ex);
+        InterruptCallback::check();
+    }
+
+    hnsw_stats.combine({n1, n2, ndis, nhops});
+}
+
+void IndexHNSW::search_layer0_trace(
+        idx_t n,
+        const float* x,
+        idx_t k,
+        idx_t ef,
+        const idx_t* hide_labels,
+        idx_t max_steps,
+        uint64_t* step_counts,
+        uint64_t* truncated_flags,
+        uint64_t* distance_counts,
+        float* closest_dists,
+        idx_t* node_labels,
+        uint64_t* rs_sizes,
+        uint64_t* rs_sizes_after,
+        uint64_t* is_full_pop_after,
+        uint64_t* full_pop_counts_after,
+        uint64_t* popped_degrees,
+        uint64_t* unvisited_counts,
+        uint64_t* accepted_counts,
+        float* runtime_accepted_rates,
+        float* runtime_cfrs,
+        float* runtime_smoothed_cfrs,
+        float* internal_dists,
+        float* popped_query_dists,
+        float* furthest_dists,
+        float* best_dists,
+        float* top_k_dists,
+        float* ef_half_dists,
+        float* ef_quarter_dists,
+        float* sqrt_ef_dists,
+        float* top_2k_dists,
+        float* top_3k_dists,
+        const SearchParameters* params) const {
+    FAISS_THROW_IF_NOT_MSG(
+            storage,
+            "No storage index, please use IndexHNSWFlat (or variants) "
+            "instead of IndexHNSW directly");
+    FAISS_THROW_IF_NOT(k > 0);
+    FAISS_THROW_IF_NOT(ef > 0);
+    FAISS_THROW_IF_NOT(max_steps > 0);
+    FAISS_THROW_IF_NOT(x);
+    FAISS_THROW_IF_NOT(hide_labels);
+    FAISS_THROW_IF_NOT(step_counts);
+    FAISS_THROW_IF_NOT(truncated_flags);
+    FAISS_THROW_IF_NOT(distance_counts);
+    FAISS_THROW_IF_NOT(closest_dists);
+    FAISS_THROW_IF_NOT(node_labels);
+    FAISS_THROW_IF_NOT(rs_sizes);
+    FAISS_THROW_IF_NOT(rs_sizes_after);
+    FAISS_THROW_IF_NOT(is_full_pop_after);
+    FAISS_THROW_IF_NOT(full_pop_counts_after);
+    FAISS_THROW_IF_NOT(popped_degrees);
+    FAISS_THROW_IF_NOT(unvisited_counts);
+    FAISS_THROW_IF_NOT(accepted_counts);
+    FAISS_THROW_IF_NOT(runtime_accepted_rates);
+    FAISS_THROW_IF_NOT(runtime_cfrs);
+    FAISS_THROW_IF_NOT(runtime_smoothed_cfrs);
+    FAISS_THROW_IF_NOT(internal_dists);
+    FAISS_THROW_IF_NOT(popped_query_dists);
+    FAISS_THROW_IF_NOT(furthest_dists);
+    FAISS_THROW_IF_NOT(best_dists);
+    FAISS_THROW_IF_NOT(top_k_dists);
+    FAISS_THROW_IF_NOT(ef_half_dists);
+    FAISS_THROW_IF_NOT(ef_quarter_dists);
+    FAISS_THROW_IF_NOT(sqrt_ef_dists);
+    FAISS_THROW_IF_NOT(top_2k_dists);
+    FAISS_THROW_IF_NOT(top_3k_dists);
+
+    const bool similarity_metric = is_similarity_metric(this->metric_type);
+    const HNSW& hnsw = this->hnsw;
+    SageTraceOutputs trace;
+    trace.max_steps = max_steps;
+    trace.step_counts = step_counts;
+    trace.truncated_flags = truncated_flags;
+    trace.distance_counts = distance_counts;
+    trace.closest_dists = closest_dists;
+    trace.node_labels = node_labels;
+    trace.rs_sizes = rs_sizes;
+    trace.rs_sizes_after = rs_sizes_after;
+    trace.is_full_pop_after = is_full_pop_after;
+    trace.full_pop_counts_after = full_pop_counts_after;
+    trace.popped_degrees = popped_degrees;
+    trace.unvisited_counts = unvisited_counts;
+    trace.accepted_counts = accepted_counts;
+    trace.runtime_accepted_rates = runtime_accepted_rates;
+    trace.runtime_cfrs = runtime_cfrs;
+    trace.runtime_smoothed_cfrs = runtime_smoothed_cfrs;
+    trace.internal_dists = internal_dists;
+    trace.popped_query_dists = popped_query_dists;
+    trace.furthest_dists = furthest_dists;
+    trace.best_dists = best_dists;
+    trace.top_k_dists = top_k_dists;
+    trace.ef_half_dists = ef_half_dists;
+    trace.ef_quarter_dists = ef_quarter_dists;
+    trace.sqrt_ef_dists = sqrt_ef_dists;
+    trace.top_2k_dists = top_2k_dists;
+    trace.top_3k_dists = top_3k_dists;
+
+    size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
+    idx_t check_period = InterruptCallback::get_period_hint(
+            std::max<int>(hnsw.max_level, 1) * this->d * std::max<idx_t>(ef, 1));
+
+    for (idx_t i0 = 0; i0 < n; i0 += check_period) {
+        idx_t i1 = std::min(i0 + check_period, n);
+        std::exception_ptr ex;
+        std::atomic<bool> interrupt{false};
+
+#pragma omp parallel if (i1 - i0 > 1)
+        {
+            std::unique_ptr<VisitedTable> vt;
+            std::unique_ptr<DistanceComputer> dis;
+            try {
+                vt = std::make_unique<VisitedTable>(
+                        this->ntotal, hnsw.use_visited_hashset);
+                dis.reset(storage_distance_computer(this->storage));
+            } catch (...) {
+                omp_capture_exception(ex, [&] { interrupt = true; });
+            }
+
+#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(guided)
+            for (idx_t i = i0; i < i1; i++) {
+                if (interrupt.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                try {
+                    step_counts[i] = 0;
+                    truncated_flags[i] = 0;
+                    distance_counts[i] = 0;
+                    closest_dists[i] = std::numeric_limits<float>::infinity();
+
+                    dis->set_query(x + i * this->d);
+                    SageEntryPointResult entry = sage_resolve_search_entry_hidden(
+                            *this, *dis, hide_labels[i]);
+                    if (entry.nearest >= 0) {
+                        SageLevel0SearchResult stats = sage_search_level0_hidden(
+                                *this,
+                                *dis,
+                                *vt,
+                                entry.nearest,
+                                entry.distance,
+                                k,
+                                ef,
+                                hide_labels[i],
+                                similarity_metric,
+                                params,
+                                nullptr,
+                                nullptr,
+                                &trace,
+                                i);
+                        step_counts[i] = static_cast<uint64_t>(stats.stored_steps);
+                        truncated_flags[i] = stats.truncated ? 1 : 0;
+                        distance_counts[i] = static_cast<uint64_t>(
+                                entry.distance_count + stats.distance_count);
+                        closest_dists[i] = stats.closest_dist;
+                        n1 += 1;
+                        n2 += stats.exhausted ? 1 : 0;
+                        ndis += entry.distance_count + stats.distance_count;
+                        nhops += stats.hop_count;
+                    }
+                    vt->advance();
+                } catch (...) {
+                    omp_capture_exception(ex, [&] { interrupt = true; });
+                }
+            }
+        }
+        omp_rethrow_if_exception(ex);
+        InterruptCallback::check();
+    }
+
+    hnsw_stats.combine({n1, n2, ndis, nhops});
+}
+
+void IndexHNSW::search_layer0_chr_summary(
+        idx_t n,
+        const float* x,
+        idx_t k,
+        idx_t ef,
+        const idx_t* hide_labels,
+        uint64_t* full_pop_counts,
+        uint64_t* window_obs_counts,
+        uint64_t* usable_flags,
+        uint64_t* distance_counts,
+        float* mean_smoothed_cfrs,
+        float* closest_dists,
+        const SearchParameters* params) const {
+    FAISS_THROW_IF_NOT_MSG(
+            storage,
+            "No storage index, please use IndexHNSWFlat (or variants) "
+            "instead of IndexHNSW directly");
+    FAISS_THROW_IF_NOT(k > 0);
+    FAISS_THROW_IF_NOT(ef > 0);
+    FAISS_THROW_IF_NOT(x);
+    FAISS_THROW_IF_NOT(hide_labels);
+    FAISS_THROW_IF_NOT(full_pop_counts);
+    FAISS_THROW_IF_NOT(window_obs_counts);
+    FAISS_THROW_IF_NOT(usable_flags);
+    FAISS_THROW_IF_NOT(distance_counts);
+    FAISS_THROW_IF_NOT(mean_smoothed_cfrs);
+    FAISS_THROW_IF_NOT(closest_dists);
+
+    const bool similarity_metric = is_similarity_metric(this->metric_type);
+    const HNSW& hnsw = this->hnsw;
+    size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
+    idx_t check_period = InterruptCallback::get_period_hint(
+            std::max<int>(hnsw.max_level, 1) * this->d * std::max<idx_t>(ef, 1));
+
+    for (idx_t i0 = 0; i0 < n; i0 += check_period) {
+        idx_t i1 = std::min(i0 + check_period, n);
+        std::exception_ptr ex;
+        std::atomic<bool> interrupt{false};
+
+#pragma omp parallel if (i1 - i0 > 1)
+        {
+            std::unique_ptr<VisitedTable> vt;
+            std::unique_ptr<DistanceComputer> dis;
+            try {
+                vt = std::make_unique<VisitedTable>(
+                        this->ntotal, hnsw.use_visited_hashset);
+                dis.reset(storage_distance_computer(this->storage));
+            } catch (...) {
+                omp_capture_exception(ex, [&] { interrupt = true; });
+            }
+
+#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(guided)
+            for (idx_t i = i0; i < i1; i++) {
+                if (interrupt.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                try {
+                    full_pop_counts[i] = 0;
+                    window_obs_counts[i] = 0;
+                    usable_flags[i] = 0;
+                    distance_counts[i] = 0;
+                    mean_smoothed_cfrs[i] = std::numeric_limits<float>::quiet_NaN();
+                    closest_dists[i] = std::numeric_limits<float>::infinity();
+
+                    dis->set_query(x + i * this->d);
+                    SageEntryPointResult entry = sage_resolve_search_entry_hidden(
+                            *this, *dis, hide_labels[i]);
+                    if (entry.nearest >= 0) {
+                        SageLevel0SearchResult stats = sage_search_level0_hidden(
+                                *this,
+                                *dis,
+                                *vt,
+                                entry.nearest,
+                                entry.distance,
+                                k,
+                                ef,
+                                hide_labels[i],
+                                similarity_metric,
+                                params,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                i);
+                        full_pop_counts[i] = static_cast<uint64_t>(stats.full_pop_count);
+                        window_obs_counts[i] = static_cast<uint64_t>(stats.window_obs_count);
+                        usable_flags[i] = stats.usable_for_mean_window ? 1 : 0;
+                        distance_counts[i] = static_cast<uint64_t>(
+                                entry.distance_count + stats.distance_count);
+                        mean_smoothed_cfrs[i] = stats.mean_smoothed_cfr_classify_window;
+                        closest_dists[i] = stats.closest_dist;
+                        n1 += 1;
+                        n2 += stats.exhausted ? 1 : 0;
+                        ndis += entry.distance_count + stats.distance_count;
+                        nhops += stats.hop_count;
+                    }
+                    vt->advance();
+                } catch (...) {
+                    omp_capture_exception(ex, [&] { interrupt = true; });
+                }
+            }
+        }
+        omp_rethrow_if_exception(ex);
+        InterruptCallback::check();
+    }
+
+    hnsw_stats.combine({n1, n2, ndis, nhops});
+}
+
+void IndexHNSW::knn_query_beam_width_first_target_hit_step(
+        idx_t n,
+        const float* x,
+        idx_t target_k,
+        const idx_t* target_labels,
+        const uint64_t* target_hits,
+        idx_t k,
+        idx_t ef_before,
+        idx_t switch_pop,
+        idx_t switch_full_pop,
+        idx_t ef_after,
+        uint64_t* first_steps,
+        uint64_t* reached_flags,
+        uint64_t* achieved_hits,
+        const SearchParameters* params) const {
+    FAISS_THROW_IF_NOT_MSG(
+            storage,
+            "No storage index, please use IndexHNSWFlat (or variants) "
+            "instead of IndexHNSW directly");
+    FAISS_THROW_IF_NOT(k > 0);
+    FAISS_THROW_IF_NOT(target_k > 0);
+    FAISS_THROW_IF_NOT(target_labels);
+    FAISS_THROW_IF_NOT(target_hits);
+    FAISS_THROW_IF_NOT(first_steps);
+    FAISS_THROW_IF_NOT(reached_flags);
+    FAISS_THROW_IF_NOT(achieved_hits);
+
+    const HNSW& hnsw = this->hnsw;
+    size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
+    idx_t check_period = InterruptCallback::get_period_hint(
+            hnsw.max_level * this->d * std::max<idx_t>(ef_before, 1));
+
+    for (idx_t i0 = 0; i0 < n; i0 += check_period) {
+        idx_t i1 = std::min(i0 + check_period, n);
+        std::exception_ptr ex;
+        std::atomic<bool> interrupt{false};
+
+#pragma omp parallel if (i1 - i0 > 1)
+        {
+            std::unique_ptr<VisitedTable> vt;
+            std::unique_ptr<DistanceComputer> dis;
+            try {
+                vt = std::make_unique<VisitedTable>(
+                        this->ntotal, hnsw.use_visited_hashset);
+                dis.reset(storage_distance_computer(this->storage));
+            } catch (...) {
+                omp_capture_exception(ex, [&] { interrupt = true; });
+            }
+
+#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(guided)
+            for (idx_t i = i0; i < i1; i++) {
+                if (interrupt.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                try {
+                    dis->set_query(x + i * this->d);
+                    HNSWTargetHitStats stats =
+                            hnsw.search_first_target_hit_step(
+                                    *dis,
+                                    this,
+                                    *vt,
+                                    k,
+                                    ef_before,
+                                    switch_pop,
+                                    switch_full_pop,
+                                    ef_after,
+                                    target_labels + i * target_k,
+                                    static_cast<size_t>(target_k),
+                                    static_cast<size_t>(target_hits[i]),
+                                    params);
+                    first_steps[i] =
+                            static_cast<uint64_t>(stats.first_target_hit_step);
+                    reached_flags[i] =
+                            static_cast<uint64_t>(stats.reached_target);
+                    achieved_hits[i] =
+                            static_cast<uint64_t>(stats.achieved_hit_count);
+                    n1 += stats.search_stats.n1;
+                    n2 += stats.search_stats.n2;
+                    ndis += stats.search_stats.ndis;
+                    nhops += stats.search_stats.nhops;
+                } catch (...) {
+                    omp_capture_exception(ex, [&] { interrupt = true; });
+                }
+            }
+        }
+        omp_rethrow_if_exception(ex);
+        InterruptCallback::check();
+    }
+
+    hnsw_stats.combine({n1, n2, ndis, nhops});
 }
 
 void IndexHNSW::range_search(
