@@ -848,62 +848,68 @@ void hnsw_search_adaptive_light(
 
     size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
 
+    // adaptive-light query cost is bimodal: easy queries early-stop cheaply
+    // while hard queries run to efSearch. Unlike vanilla hnsw_search, we do NOT
+    // fragment the query stream into check_period-sized chunks with a fresh
+    // parallel region (and implicit barrier) per chunk: with bimodal costs each
+    // barrier stalls every thread on the chunk's single hardest query, and
+    // because check_period is proportional to 1/efSearch that stall grows as ef
+    // rises, collapsing multi-thread QPS at high ef. Instead we open ONE
+    // parallel region over the whole query set (schedule(dynamic) hides the
+    // hard-query tail across all n queries) and check for interruption inside
+    // the loop on a per-thread counter, decoupling interrupt cadence from
+    // parallel granularity (same approach as the add path).
     idx_t check_period = InterruptCallback::get_period_hint(
             hnsw.max_level * index->d * std::max(params->efSearch, 1));
 
-    for (idx_t i0 = 0; i0 < n; i0 += check_period) {
-        idx_t i1 = std::min(i0 + check_period, n);
-        std::exception_ptr ex;
-        std::atomic<bool> interrupt{false};
+    std::exception_ptr ex;
+    std::atomic<bool> interrupt{false};
 
-#pragma omp parallel if (i1 - i0 > 1)
-        {
-            std::unique_ptr<VisitedTable> vt;
-            std::unique_ptr<typename BlockResultHandler::SingleResultHandler>
-                    res;
-            std::unique_ptr<DistanceComputer> dis;
+#pragma omp parallel if (n > 1)
+    {
+        std::unique_ptr<VisitedTable> vt;
+        std::unique_ptr<typename BlockResultHandler::SingleResultHandler> res;
+        std::unique_ptr<DistanceComputer> dis;
+        try {
+            vt = std::make_unique<VisitedTable>(
+                    index->ntotal, hnsw.use_visited_hashset);
+            res = std::make_unique<
+                    typename BlockResultHandler::SingleResultHandler>(bres);
+            dis.reset(storage_distance_computer(index->storage));
+        } catch (...) {
+            omp_capture_exception(ex, [&] { interrupt = true; });
+        }
+
+        size_t counter = 0;
+#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(dynamic)
+        for (idx_t i = 0; i < n; i++) {
+            if (interrupt.load(std::memory_order_relaxed)) {
+                continue;
+            }
             try {
-                vt = std::make_unique<VisitedTable>(
-                        index->ntotal, hnsw.use_visited_hashset);
-                res = std::make_unique<
-                        typename BlockResultHandler::SingleResultHandler>(bres);
-                dis.reset(storage_distance_computer(index->storage));
+                res->begin(i);
+                dis->set_query(x + i * index->d);
+
+                HNSWStats stats = hnsw.search_adaptive_light(
+                        *dis, index, *res, *vt, params);
+                n1 += stats.n1;
+                n2 += stats.n2;
+                ndis += stats.ndis;
+                nhops += stats.nhops;
+                res->end();
+                vt->advance();
+
+                if (counter++ % check_period == 0 &&
+                    InterruptCallback::is_interrupted()) {
+                    interrupt = true;
+                }
             } catch (...) {
                 omp_capture_exception(ex, [&] { interrupt = true; });
             }
-
-            // adaptive-light query cost is bimodal: easy queries early-stop
-            // cheaply while hard queries run long. guided hands out large
-            // initial chunks, so a thread that draws a chunk full of hard
-            // queries becomes a straggler while the rest idle, capping
-            // multi-thread scaling at ~80-90% efficiency. dynamic spreads the
-            // hard queries across threads; per-query work (>= CLASSIFY_END full
-            // pops) dwarfs the scheduler's atomic overhead.
-#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(dynamic)
-            for (idx_t i = i0; i < i1; i++) {
-                if (interrupt.load(std::memory_order_relaxed)) {
-                    continue;
-                }
-                try {
-                    res->begin(i);
-                    dis->set_query(x + i * index->d);
-
-                    HNSWStats stats = hnsw.search_adaptive_light(
-                            *dis, index, *res, *vt, params);
-                    n1 += stats.n1;
-                    n2 += stats.n2;
-                    ndis += stats.ndis;
-                    nhops += stats.nhops;
-                    res->end();
-                    vt->advance();
-                } catch (...) {
-                    omp_capture_exception(ex, [&] { interrupt = true; });
-                }
-            }
         }
-        omp_rethrow_if_exception(ex);
-        InterruptCallback::check();
     }
+    omp_rethrow_if_exception(ex);
+    InterruptCallback::check();
 
     hnsw_stats.combine({n1, n2, ndis, nhops});
 }
