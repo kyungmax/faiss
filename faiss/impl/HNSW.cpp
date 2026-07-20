@@ -376,7 +376,11 @@ void search_neighbors_to_add(
         float d_entry_point,
         int level,
         VisitedTable& vt,
-        bool reference_version) {
+        bool reference_version,
+        int efConstruction) {
+    const size_t effective_efConstruction = efConstruction > 0
+            ? static_cast<size_t>(efConstruction)
+            : static_cast<size_t>(hnsw.efConstruction);
     // top is nearest candidate
     std::priority_queue<NodeDistFarther> candidates;
 
@@ -421,12 +425,11 @@ void search_neighbors_to_add(
                 float dis = qdis(nodeId);
                 NodeDistFarther evE1(dis, nodeId);
 
-                if (results.size() < static_cast<size_t>(hnsw.efConstruction) ||
+                if (results.size() < effective_efConstruction ||
                     results.top().d > dis) {
                     results.emplace(dis, nodeId);
                     candidates.emplace(dis, nodeId);
-                    if (results.size() >
-                        static_cast<size_t>(hnsw.efConstruction)) {
+                    if (results.size() > effective_efConstruction) {
                         results.pop();
                     }
                 }
@@ -437,12 +440,11 @@ void search_neighbors_to_add(
             // the following version processes 4 neighbors at a time
             auto update_with_candidate = [&](const storage_idx_t idx,
                                              const float dis) {
-                if (results.size() < static_cast<size_t>(hnsw.efConstruction) ||
+                if (results.size() < effective_efConstruction ||
                     results.top().d > dis) {
                     results.emplace(dis, idx);
                     candidates.emplace(dis, idx);
-                    if (results.size() >
-                        static_cast<size_t>(hnsw.efConstruction)) {
+                    if (results.size() > effective_efConstruction) {
                         results.pop();
                     }
                 }
@@ -504,11 +506,20 @@ void HNSW::add_links_starting_from(
         int level,
         LockVector& locks,
         VisitedTable& vt,
-        bool keep_max_size_level0) {
+        bool keep_max_size_level0,
+        int efConstruction) {
     std::priority_queue<NodeDistCloser> link_targets;
 
     search_neighbors_to_add(
-            *this, ptdis, link_targets, nearest, d_nearest, level, vt);
+            *this,
+            ptdis,
+            link_targets,
+            nearest,
+            d_nearest,
+            level,
+            vt,
+            false,
+            efConstruction);
 
     // but we can afford only this many neighbors
     int M = nb_neighbors(level);
@@ -543,7 +554,8 @@ void HNSW::add_with_locks(
         int pt_id,
         LockVector& locks,
         VisitedTable& vt,
-        bool keep_max_size_level0) {
+        bool keep_max_size_level0,
+        int efConstruction) {
     storage_idx_t nearest = entry_point;
     if (nearest == -1) { // avoid locking after the first point.
 #pragma omp critical
@@ -580,7 +592,8 @@ void HNSW::add_with_locks(
                 level,
                 locks,
                 vt,
-                keep_max_size_level0);
+                keep_max_size_level0,
+                efConstruction);
     }
 
     locks.unlock(pt_id);
@@ -929,11 +942,32 @@ int search_from_candidates_adaptive_light(
         VisitedTable& vt,
         HNSWStats& stats,
         const SearchParametersHNSWAdaptiveLight& params) {
-    static constexpr size_t HARD_ONLY_STAG_LIMIT = 20;
-    static constexpr int CLASSIFY_START = 4;
-    static constexpr int CLASSIFY_END = 16;
-    static constexpr float CFR_EMA_DECAY = 0.8f;
-    static constexpr float CFR_EMA_UPDATE = 1.0f - CFR_EMA_DECAY;
+    FAISS_THROW_IF_NOT_FMT(
+            params.classify_start >= 0,
+            "classify_start must be >= 0, got %d",
+            params.classify_start);
+    FAISS_THROW_IF_NOT_FMT(
+            params.classify_end >= params.classify_start &&
+                    params.classify_end >= 1,
+            "classify_end must be >= max(classify_start, 1), got start=%d end=%d",
+            params.classify_start,
+            params.classify_end);
+    FAISS_THROW_IF_NOT_MSG(
+            std::isfinite(params.chr_ema_decay) &&
+                    params.chr_ema_decay >= 0.0f &&
+                    params.chr_ema_decay <= 1.0f,
+            "chr_ema_decay must be finite and lie in [0, 1]");
+    FAISS_THROW_IF_NOT_FMT(
+            params.hard_stagnation_count >= 1,
+            "hard_stagnation_count must be >= 1, got %d",
+            params.hard_stagnation_count);
+
+    const size_t hard_only_stag_limit =
+            static_cast<size_t>(params.hard_stagnation_count);
+    const int classify_start = params.classify_start;
+    const int classify_end = params.classify_end;
+    const float cfr_ema_decay = params.chr_ema_decay;
+    const float cfr_ema_update = 1.0f - cfr_ema_decay;
 
     FAISS_THROW_IF_NOT_MSG(
             params.bounded_queue,
@@ -957,6 +991,7 @@ int search_from_candidates_adaptive_light(
     bool effective_ef_shrink_applied = false;
     int full_pop_count = 0;
     int stagnation_count = 0;
+    bool stopped_by_hard_stagnation = false;
     float prev_furthest = std::numeric_limits<float>::max();
     float smoothed_cfr_ema = std::numeric_limits<float>::quiet_NaN();
     float classify_smoothed_cfr_sum = 0.0f;
@@ -975,7 +1010,7 @@ int search_from_candidates_adaptive_light(
             !params.paper_bucket_mode &&
             std::isfinite(params.mid_easy_upper_gamma_ratio);
     const int effective_tmin_pops = direct_classifier_threshold_enabled
-            ? std::max(params.tmin_pops, CLASSIFY_END)
+            ? std::max(params.tmin_pops, classify_end)
             : params.tmin_pops;
 
     MinimaxHeap candidates(static_cast<int>(configured_ef_cur));
@@ -1080,16 +1115,17 @@ int search_from_candidates_adaptive_light(
                 smoothed_cfr_ema = cfr;
             } else {
                 smoothed_cfr_ema =
-                        CFR_EMA_DECAY * smoothed_cfr_ema + CFR_EMA_UPDATE * cfr;
+                        cfr_ema_decay * smoothed_cfr_ema +
+                        cfr_ema_update * cfr;
             }
 
-            if (full_pop_count >= CLASSIFY_START &&
-                full_pop_count <= CLASSIFY_END) {
+            if (full_pop_count >= classify_start &&
+                full_pop_count <= classify_end) {
                 classify_smoothed_cfr_sum += smoothed_cfr_ema;
                 classify_smoothed_cfr_count++;
 
                 if (!classification_evaluated &&
-                    full_pop_count == CLASSIFY_END) {
+                    full_pop_count == classify_end) {
                     classification_evaluated = true;
                     if (direct_classifier_threshold_enabled) {
                         classify_cfr_mean = classify_smoothed_cfr_sum /
@@ -1180,6 +1216,7 @@ int search_from_candidates_adaptive_light(
             }
 
             const bool hard_stop_enabled = params.enable_stop &&
+                    params.hard_stagnation_enabled &&
                     direct_classifier_threshold_enabled &&
                     classification_evaluated && !is_easy_query &&
                     full_pop_count >= effective_tmin_pops &&
@@ -1192,7 +1229,8 @@ int search_from_candidates_adaptive_light(
                 }
 
                 if (static_cast<size_t>(std::max(stagnation_count, 0)) >=
-                    HARD_ONLY_STAG_LIMIT) {
+                    hard_only_stag_limit) {
+                    stopped_by_hard_stagnation = true;
                     stop_search = true;
                 }
             }
@@ -1212,6 +1250,7 @@ int search_from_candidates_adaptive_light(
     }
     stats.ndis += ndis;
     stats.nhops += nstep;
+    stats.hard_stagnation_stops += stopped_by_hard_stagnation ? 1 : 0;
 
     return 0;
 }

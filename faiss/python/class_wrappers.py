@@ -329,6 +329,25 @@ def handle_Index(the_class):
         else:
             self.add_with_ids_ex(n, swig_ptr(x), numeric_type, swig_ptr(ids))
 
+    def replacement_add_with_variable_ef_construction(self, x, ef_constructions):
+        """Adds vectors with one efConstruction value per vector.
+
+        This is available for HNSW indexes and mirrors the hnswlib
+        add_items_variable_ef_construction experiment API.
+        """
+        n, d = x.shape
+        assert d == self.d
+        ef_constructions = np.asarray(ef_constructions)
+        assert ef_constructions.shape == (n,), \
+            'ef_constructions must have one value per vector'
+        x = np.ascontiguousarray(x, dtype='float32')
+        ef_constructions = np.ascontiguousarray(
+            ef_constructions, dtype='uint64')
+        if np.any(ef_constructions == 0):
+            raise ValueError('ef_construction values must be positive')
+        self.add_with_variable_ef_construction_c(
+            n, swig_ptr(x), swig_ptr(ef_constructions))
+
 
     def replacement_assign(self, x, k, labels=None):
         """Find the k nearest neighbors of the set of vectors x in the index.
@@ -477,7 +496,12 @@ def handle_Index(the_class):
             early_stop_ratio=0.6,
             tmin_pops=25,
             super_easy_gamma_ratio=np.nan,
-            mid_easy_upper_gamma_ratio=np.nan):
+            mid_easy_upper_gamma_ratio=np.nan,
+            classify_start=4,
+            classify_end=16,
+            chr_ema_decay=0.8,
+            hard_stagnation_enabled=True,
+            hard_stagnation_count=20):
         """Python wrapper for the Faiss adaptive-light query API."""
 
         selector = _selector_from_faiss_filter(filter)
@@ -501,6 +525,11 @@ def handle_Index(the_class):
         params.early_stop_ratio = float(early_stop_ratio)
         params.super_easy_gamma_ratio = float(super_easy_gamma_ratio)
         params.mid_easy_upper_gamma_ratio = float(mid_easy_upper_gamma_ratio)
+        params.classify_start = int(classify_start)
+        params.classify_end = int(classify_end)
+        params.chr_ema_decay = float(chr_ema_decay)
+        params.hard_stagnation_enabled = bool(hard_stagnation_enabled)
+        params.hard_stagnation_count = int(hard_stagnation_count)
         params.bounded_queue = True
         params.sel = selector
 
@@ -529,7 +558,12 @@ def handle_Index(the_class):
             early_stop_ratio=0.6,
             tmin_pops=25,
             paper_bucket_count=4,
-            bucket_gamma_ratios=()):
+            bucket_gamma_ratios=(),
+            classify_start=4,
+            classify_end=16,
+            chr_ema_decay=0.8,
+            hard_stagnation_enabled=True,
+            hard_stagnation_count=20):
         """Python wrapper for the Faiss paper-bucket adaptive-light query API."""
 
         selector = _selector_from_faiss_filter(filter)
@@ -551,6 +585,11 @@ def handle_Index(the_class):
         params.enable_stop = bool(enable_stop)
         params.tmin_pops = int(tmin_pops)
         params.early_stop_ratio = float(early_stop_ratio)
+        params.classify_start = int(classify_start)
+        params.classify_end = int(classify_end)
+        params.chr_ema_decay = float(chr_ema_decay)
+        params.hard_stagnation_enabled = bool(hard_stagnation_enabled)
+        params.hard_stagnation_count = int(hard_stagnation_count)
         params.bounded_queue = True
         params.paper_bucket_mode = True
         params.paper_bucket_count = int(paper_bucket_count)
@@ -570,6 +609,84 @@ def handle_Index(the_class):
                 faiss.omp_set_num_threads(int(prev_num_threads))
 
         return I, D
+
+    def replacement_knn_query_adaptive_analysis(
+            self,
+            x,
+            k=1,
+            ef_init=128,
+            ef_max=None,
+            enable_stop=True,
+            num_threads=-1,
+            filter=None,
+            early_stop_ratio=0.6,
+            tmin_pops=25,
+            paper_bucket_count=4,
+            bucket_gamma_ratios=(),
+            classify_start=4,
+            classify_end=16,
+            chr_ema_decay=0.8,
+            hard_stagnation_enabled=True,
+            hard_stagnation_count=20):
+        """Return labels plus per-query adaptive hard-stagnation analysis stats."""
+
+        selector = _selector_from_faiss_filter(filter)
+
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+
+        x = np.ascontiguousarray(x, dtype="float32")
+        D = np.empty((n, k), dtype=np.float32)
+        I = np.empty((n, k), dtype=np.int64)
+        pop_steps = np.empty((n,), dtype=np.uint64)
+        stop_flags = np.empty((n,), dtype=np.uint64)
+        distance_counts = np.empty((n,), dtype=np.uint64)
+
+        params = faiss.SearchParametersHNSWAdaptiveLight()
+        params.efSearch = int(ef_init)
+        if ef_max is None:
+            params.efMax = max(int(ef_init), 1024)
+        else:
+            params.efMax = max(int(ef_init), int(ef_max))
+        params.enable_stop = bool(enable_stop)
+        params.tmin_pops = int(tmin_pops)
+        params.early_stop_ratio = float(early_stop_ratio)
+        params.classify_start = int(classify_start)
+        params.classify_end = int(classify_end)
+        params.chr_ema_decay = float(chr_ema_decay)
+        params.hard_stagnation_enabled = bool(hard_stagnation_enabled)
+        params.hard_stagnation_count = int(hard_stagnation_count)
+        params.bounded_queue = True
+        params.paper_bucket_mode = True
+        params.paper_bucket_count = int(paper_bucket_count)
+        params.sel = selector
+        _assign_paper_bucket_gamma_ratios(params, bucket_gamma_ratios)
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.knn_query_adaptive_analysis_c(
+                n,
+                swig_ptr(x),
+                k,
+                swig_ptr(D),
+                swig_ptr(I),
+                swig_ptr(pop_steps),
+                swig_ptr(stop_flags),
+                swig_ptr(distance_counts),
+                params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return I, D, pop_steps, stop_flags, distance_counts
 
     def replacement_knn_query_hide_node(
             self,
@@ -701,8 +818,11 @@ def handle_Index(the_class):
         base_max_steps = int(max_steps) if int(max_steps) > 0 else max(256, int(ef) * 4 + 64)
         max_cells_per_chunk = 1_000_000
 
-        params = faiss.SearchParametersHNSW()
+        params = faiss.SearchParametersHNSWAdaptiveLight()
         params.efSearch = int(ef)
+        params.classify_start = int(classify_start)
+        params.classify_end = int(classify_end)
+        params.chr_ema_decay = float(chr_ema_decay)
         params.sel = selector
 
         def run_once(active_max_steps):
@@ -827,7 +947,10 @@ def handle_Index(the_class):
             ef=128,
             hide_labels=None,
             num_threads=-1,
-            filter=None):
+            filter=None,
+            classify_start=4,
+            classify_end=16,
+            chr_ema_decay=0.8):
         """Return native Faiss per-query CHR window summaries for SAGE calibration."""
 
         selector = _selector_from_faiss_filter(filter)
@@ -1420,11 +1543,20 @@ def handle_Index(the_class):
 
     replace_method(the_class, 'add', replacement_add)
     replace_method(the_class, 'add_with_ids', replacement_add_with_ids)
+    replace_method(the_class, 'add_with_variable_ef_construction',
+                   replacement_add_with_variable_ef_construction,
+                   ignore_missing=True)
+    if hasattr(the_class, "add_with_variable_ef_construction_c"):
+        setattr(the_class, "add_items_variable_ef_construction",
+                replacement_add_with_variable_ef_construction)
     replace_method(the_class, 'assign', replacement_assign)
     replace_method(the_class, 'train', replacement_train)
     replace_method(the_class, 'search', replacement_search)
     replace_method(the_class, 'knn_query_adaptive_light',
                    replacement_knn_query_adaptive_light, ignore_missing=True)
+    replace_method(the_class, 'knn_query_adaptive_analysis',
+                   replacement_knn_query_adaptive_analysis,
+                   ignore_missing=True)
     replace_method(the_class, 'knn_query_hide_node',
                    replacement_knn_query_hide_node, ignore_missing=True)
     replace_method(the_class, 'compute_internal_lids',
@@ -1436,6 +1568,9 @@ def handle_Index(the_class):
     if hasattr(the_class, "knn_query_adaptive_light_c"):
         setattr(the_class, "knn_query_adaptive_light_paper_bucket",
                 replacement_knn_query_adaptive_light_paper_bucket)
+    if hasattr(the_class, "knn_query_adaptive_analysis_c"):
+        setattr(the_class, "knn_query_adaptive_analysis_paper_bucket",
+                replacement_knn_query_adaptive_analysis)
     replace_method(the_class, 'knn_query_beam_width_first_target_hit_step',
                    replacement_knn_query_beam_width_first_target_hit_step,
                    ignore_missing=True)

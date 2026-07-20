@@ -225,6 +225,42 @@ struct SageLevel0SearchResult {
     float closest_dist = std::numeric_limits<float>::infinity();
 };
 
+struct SageChrWindowConfig {
+    int classify_start = 4;
+    int classify_end = 16;
+    float chr_ema_decay = 0.8f;
+};
+
+static SageChrWindowConfig sage_resolve_chr_window_config(
+        const SearchParameters* params) {
+    SageChrWindowConfig config;
+    if (params) {
+        const auto adaptive_params =
+                dynamic_cast<const SearchParametersHNSWAdaptiveLight*>(params);
+        if (adaptive_params) {
+            config.classify_start = adaptive_params->classify_start;
+            config.classify_end = adaptive_params->classify_end;
+            config.chr_ema_decay = adaptive_params->chr_ema_decay;
+        }
+    }
+    FAISS_THROW_IF_NOT_FMT(
+            config.classify_start >= 0,
+            "classify_start must be >= 0, got %d",
+            config.classify_start);
+    FAISS_THROW_IF_NOT_FMT(
+            config.classify_end >= config.classify_start &&
+                    config.classify_end >= 1,
+            "classify_end must be >= max(classify_start, 1), got start=%d end=%d",
+            config.classify_start,
+            config.classify_end);
+    FAISS_THROW_IF_NOT_MSG(
+            std::isfinite(config.chr_ema_decay) &&
+                    config.chr_ema_decay >= 0.0f &&
+                    config.chr_ema_decay <= 1.0f,
+            "chr_ema_decay must be finite and lie in [0, 1]");
+    return config;
+}
+
 static SageLevel0SearchResult sage_search_level0_hidden(
         const IndexHNSW& index,
         DistanceComputer& qdis,
@@ -243,6 +279,9 @@ static SageLevel0SearchResult sage_search_level0_hidden(
     SageLevel0SearchResult result;
     const HNSW& hnsw = index.hnsw;
     const IDSelector* sel = params ? params->sel : nullptr;
+    const SageChrWindowConfig chr_config =
+            sage_resolve_chr_window_config(params);
+    const float chr_ema_update = 1.0f - chr_config.chr_ema_decay;
     const size_t normalized_k = std::max<size_t>(static_cast<size_t>(k), 1);
     const size_t ef_search = std::max<size_t>(static_cast<size_t>(ef), normalized_k);
     const float nan = std::numeric_limits<float>::quiet_NaN();
@@ -348,11 +387,16 @@ static SageLevel0SearchResult sage_search_level0_hidden(
                 if (std::isnan(smoothed_cfr_ema)) {
                     smoothed_cfr_ema = runtime_cfr;
                 } else {
-                    smoothed_cfr_ema = 0.8f * smoothed_cfr_ema + 0.2f * runtime_cfr;
+                    smoothed_cfr_ema =
+                            chr_config.chr_ema_decay * smoothed_cfr_ema +
+                            chr_ema_update * runtime_cfr;
                 }
                 runtime_smoothed_cfr = smoothed_cfr_ema;
             }
-            if (full_pop_count >= 4 && full_pop_count <= 16 &&
+            if (full_pop_count >=
+                        static_cast<size_t>(chr_config.classify_start) &&
+                full_pop_count <=
+                        static_cast<size_t>(chr_config.classify_end) &&
                 std::isfinite(runtime_smoothed_cfr)) {
                 classify_window_sum += static_cast<double>(runtime_smoothed_cfr);
                 classify_window_count++;
@@ -567,7 +611,8 @@ void hnsw_add_vertices(
         size_t n,
         const float* x,
         bool verbose,
-        bool preset_levels = false) {
+        bool preset_levels = false,
+        const size_t* ef_construction_overrides = nullptr) {
     size_t d = index_hnsw.d;
     HNSW& hnsw = index_hnsw.hnsw;
     size_t ntotal = n0 + n;
@@ -623,8 +668,18 @@ void hnsw_add_vertices(
         }
     }
 
+    size_t check_efConstruction = hnsw.efConstruction > 0
+            ? static_cast<size_t>(hnsw.efConstruction)
+            : size_t(1);
+    if (ef_construction_overrides) {
+        for (size_t i = 0; i < n; i++) {
+            if (ef_construction_overrides[i] > check_efConstruction) {
+                check_efConstruction = ef_construction_overrides[i];
+            }
+        }
+    }
     idx_t check_period = InterruptCallback::get_period_hint(
-            max_level * index_hnsw.d * hnsw.efConstruction);
+            max_level * index_hnsw.d * check_efConstruction);
 
     { // perform add
         RandomGenerator rng2(789);
@@ -672,13 +727,20 @@ void hnsw_add_vertices(
                         continue;
                     }
 
+                    int efConstruction = 0;
+                    if (ef_construction_overrides) {
+                        efConstruction = static_cast<int>(
+                                ef_construction_overrides[pt_id - n0]);
+                    }
+
                     hnsw.add_with_locks(
                             *dis,
                             pt_level,
                             pt_id,
                             locks,
                             vt,
-                            index_hnsw.keep_max_size_level0 && (pt_level == 0));
+                            index_hnsw.keep_max_size_level0 && (pt_level == 0),
+                            efConstruction);
 
                     if (do_display && i - i0 > prev_display + 10000) {
                         prev_display = i - i0;
@@ -951,6 +1013,121 @@ void IndexHNSW::knn_query_adaptive_light(
     RH bres(n, distances, labels, k);
 
     hnsw_search_adaptive_light(this, n, x, bres, params);
+
+    if (is_similarity_metric(this->metric_type)) {
+        for (idx_t i = 0; i < k * n; i++) {
+            if (labels[i] < 0) {
+                distances[i] = std::numeric_limits<float>::infinity();
+            } else if (std::isfinite(distances[i])) {
+                distances[i] = 1.0f + distances[i];
+            }
+        }
+    }
+}
+
+void IndexHNSW::knn_query_adaptive_analysis(
+        idx_t n,
+        const float* x,
+        idx_t k,
+        float* distances,
+        idx_t* labels,
+        uint64_t* pop_steps,
+        uint64_t* stop_flags,
+        uint64_t* distance_counts,
+        const SearchParameters* params_in) const {
+    FAISS_THROW_IF_NOT_MSG(
+            storage,
+            "No storage index, please use IndexHNSWFlat (or variants) "
+            "instead of IndexHNSW directly");
+    FAISS_THROW_IF_NOT(k > 0);
+    FAISS_THROW_IF_NOT(x);
+    FAISS_THROW_IF_NOT(distances);
+    FAISS_THROW_IF_NOT(labels);
+    FAISS_THROW_IF_NOT(pop_steps);
+    FAISS_THROW_IF_NOT(stop_flags);
+    FAISS_THROW_IF_NOT(distance_counts);
+
+    const HNSW& hnsw = this->hnsw;
+    SearchParametersHNSWAdaptiveLight default_params;
+    default_params.efSearch = hnsw.efSearch;
+    default_params.bounded_queue = true;
+
+    const SearchParametersHNSWAdaptiveLight* params = &default_params;
+    if (params_in) {
+        params = dynamic_cast<const SearchParametersHNSWAdaptiveLight*>(
+                params_in);
+        FAISS_THROW_IF_NOT_MSG(
+                params,
+                "params must be SearchParametersHNSWAdaptiveLight");
+    }
+
+    using RH = HeapBlockResultHandler<HNSW::C>;
+    RH bres(n, distances, labels, k);
+
+    size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0, hard_stops = 0;
+    idx_t check_period = InterruptCallback::get_period_hint(
+            hnsw.max_level * this->d * std::max(params->efSearch, 1));
+
+    std::exception_ptr ex;
+    std::atomic<bool> interrupt{false};
+
+#pragma omp parallel if (n > 1)
+    {
+        std::unique_ptr<VisitedTable> vt;
+        std::unique_ptr<RH::SingleResultHandler> res;
+        std::unique_ptr<DistanceComputer> dis;
+        try {
+            vt = std::make_unique<VisitedTable>(
+                    this->ntotal, hnsw.use_visited_hashset);
+            res = std::make_unique<RH::SingleResultHandler>(bres);
+            dis.reset(storage_distance_computer(this->storage));
+        } catch (...) {
+            omp_capture_exception(ex, [&] { interrupt = true; });
+        }
+
+        size_t counter = 0;
+#pragma omp for reduction(+ : n1, n2, ndis, nhops, hard_stops) schedule(dynamic)
+        for (idx_t i = 0; i < n; i++) {
+            if (interrupt.load(std::memory_order_relaxed)) {
+                continue;
+            }
+            try {
+                res->begin(i);
+                dis->set_query(x + i * this->d);
+
+                HNSWStats stats = hnsw.search_adaptive_light(
+                        *dis, this, *res, *vt, params);
+                n1 += stats.n1;
+                n2 += stats.n2;
+                ndis += stats.ndis;
+                nhops += stats.nhops;
+                hard_stops += stats.hard_stagnation_stops;
+                pop_steps[i] = static_cast<uint64_t>(stats.nhops);
+                stop_flags[i] = static_cast<uint64_t>(
+                        stats.hard_stagnation_stops > 0 ? 1 : 0);
+                distance_counts[i] = static_cast<uint64_t>(stats.ndis);
+                res->end();
+                vt->advance();
+
+                if (counter++ % check_period == 0 &&
+                    InterruptCallback::is_interrupted()) {
+                    interrupt = true;
+                }
+            } catch (...) {
+                omp_capture_exception(ex, [&] { interrupt = true; });
+            }
+        }
+    }
+    omp_rethrow_if_exception(ex);
+    InterruptCallback::check();
+
+    HNSWStats total;
+    total.n1 = n1;
+    total.n2 = n2;
+    total.ndis = ndis;
+    total.nhops = nhops;
+    total.hard_stagnation_stops = hard_stops;
+    hnsw_stats.combine(total);
 
     if (is_similarity_metric(this->metric_type)) {
         for (idx_t i = 0; i < k * n; i++) {
@@ -1566,6 +1743,42 @@ void IndexHNSW::add(idx_t n, const float* x) {
             x,
             verbose,
             hnsw.levels.size() == static_cast<size_t>(ntotal));
+}
+
+void IndexHNSW::add_with_variable_ef_construction(
+        idx_t n,
+        const float* x,
+        const size_t* ef_constructions) {
+    FAISS_THROW_IF_NOT_MSG(
+            storage,
+            "Please use IndexHNSWFlat (or variants) instead of IndexHNSW directly");
+    FAISS_THROW_IF_NOT(is_trained);
+    FAISS_THROW_IF_NOT_MSG(
+            ef_constructions,
+            "ef_constructions must point to one positive value per input vector");
+    for (idx_t i = 0; i < n; i++) {
+        FAISS_THROW_IF_NOT_MSG(
+                ef_constructions[i] > 0,
+                "ef_construction values must be positive");
+        FAISS_THROW_IF_NOT_FMT(
+                ef_constructions[i] <=
+                        static_cast<size_t>(std::numeric_limits<int>::max()),
+                "ef_construction value %zu exceeds int max",
+                ef_constructions[i]);
+    }
+
+    size_t n0 = ntotal;
+    storage->add(n, x);
+    ntotal = storage->ntotal;
+
+    hnsw_add_vertices(
+            *this,
+            n0,
+            n,
+            x,
+            verbose,
+            hnsw.levels.size() == static_cast<size_t>(ntotal),
+            ef_constructions);
 }
 
 void IndexHNSW::reset() {

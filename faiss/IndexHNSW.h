@@ -67,6 +67,12 @@ struct IndexHNSW : Index {
     /// Adds vectors to the index. May not be called concurrently.
     void add(idx_t n, const float* x) override;
 
+    /// Adds vectors with a per-vector efConstruction override.
+    void add_with_variable_ef_construction(
+            idx_t n,
+            const float* x,
+            const size_t* ef_constructions);
+
     /// Trains the storage if needed
     void train(idx_t n, const float* x) override;
 
@@ -85,6 +91,17 @@ struct IndexHNSW : Index {
             idx_t k,
             float* distances,
             idx_t* labels,
+            const SearchParameters* params = nullptr) const;
+
+    void knn_query_adaptive_analysis(
+            idx_t n,
+            const float* x,
+            idx_t k,
+            float* distances,
+            idx_t* labels,
+            uint64_t* pop_steps,
+            uint64_t* stop_flags,
+            uint64_t* distance_counts,
             const SearchParameters* params = nullptr) const;
 
     void knn_query_hide_node(

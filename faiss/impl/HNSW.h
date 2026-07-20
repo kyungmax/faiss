@@ -65,6 +65,11 @@ struct SearchParametersHNSWAdaptiveLight : SearchParametersHNSW {
     float early_stop_ratio = 0.6f;
     float super_easy_gamma_ratio = std::numeric_limits<float>::quiet_NaN();
     float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN();
+    int classify_start = 4;
+    int classify_end = 16;
+    float chr_ema_decay = 0.8f;
+    bool hard_stagnation_enabled = true;
+    int hard_stagnation_count = 20;
     bool paper_bucket_mode = false;
     int paper_bucket_count = 4;
     float bucket_gamma_ratio_0 = std::numeric_limits<float>::quiet_NaN();
@@ -194,7 +199,8 @@ struct HNSW {
             int level,
             LockVector& locks,
             VisitedTable& vt,
-            bool keep_max_size_level0 = false);
+            bool keep_max_size_level0 = false,
+            int efConstruction = 0);
 
     /** add point pt_id on all levels <= pt_level and build the link
      * structure for them. */
@@ -204,7 +210,8 @@ struct HNSW {
             int pt_id,
             LockVector& locks,
             VisitedTable& vt,
-            bool keep_max_size_level0 = false);
+            bool keep_max_size_level0 = false,
+            int efConstruction = 0);
 
     /// Search interface for 1 point, single thread
     ///
@@ -275,11 +282,14 @@ struct HNSWStats {
             0; /// number of queries for which the candidate list is exhausted
     size_t ndis = 0;  /// number of distances computed
     size_t nhops = 0; /// number of hops aka number of edges traversed
+    size_t hard_stagnation_stops =
+            0; /// number of adaptive hard-stagnation stops
 
     void reset() {
         n1 = n2 = 0;
         ndis = 0;
         nhops = 0;
+        hard_stagnation_stops = 0;
     }
 
     void combine(const HNSWStats& other) {
@@ -287,6 +297,7 @@ struct HNSWStats {
         n2 += other.n2;
         ndis += other.ndis;
         nhops += other.nhops;
+        hard_stagnation_stops += other.hard_stagnation_stops;
     }
 };
 
@@ -351,6 +362,7 @@ void search_neighbors_to_add(
         float d_entry_point,
         int level,
         VisitedTable& vt,
-        bool reference_version = false);
+        bool reference_version = false,
+        int efConstruction = 0);
 
 } // namespace faiss

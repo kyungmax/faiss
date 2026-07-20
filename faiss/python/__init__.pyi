@@ -1804,6 +1804,16 @@ class IndexHNSW(Index):
     ]
 
     def __init__(self, d: int, M: int, metric: MetricType = METRIC_L2) -> None: ...
+    def add_with_variable_ef_construction(
+        self,
+        x: npt.NDArray[np.float32],
+        ef_constructions: npt.NDArray[np.uint64],
+    ) -> None: ...
+    def add_items_variable_ef_construction(
+        self,
+        x: npt.NDArray[np.float32],
+        ef_constructions: npt.NDArray[np.uint64],
+    ) -> None: ...
 
 class IndexHNSWFlat(IndexHNSW):
     def __init__(self, d: int, M: int, metric: MetricType = METRIC_L2) -> None: ...
