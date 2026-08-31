@@ -26,6 +26,48 @@ namespace faiss {
 
 struct IndexHNSW;
 
+/** Per-stream query-locality state for temporal HNSW search.
+ *
+ * Query vectors are normalized and stored in a contiguous ring buffer.
+ * A cache object must belong to one ordered query stream and must not be
+ * mutated concurrently.
+ */
+struct TemporalQueryCache {
+    explicit TemporalQueryCache(
+            idx_t d,
+            idx_t capacity = 32,
+            float cosine_threshold = 0.8f);
+
+    void reset();
+
+    idx_t dimension() const;
+    idx_t capacity() const;
+    idx_t size() const;
+    float cosine_threshold() const;
+    uint64_t queries_seen() const;
+    uint64_t hit_count() const;
+    float hit_rate() const;
+
+   private:
+    friend struct IndexHNSW;
+
+    idx_t d_;
+    idx_t capacity_;
+    float cosine_threshold_;
+    idx_t size_ = 0;
+    idx_t next_ = 0;
+    uint64_t queries_seen_ = 0;
+    uint64_t hit_count_ = 0;
+    std::vector<float> normalized_queries_;
+    std::vector<idx_t> top1_ids_;
+    std::vector<float> similarities_;
+    std::vector<float> normalized_query_;
+
+    void prepare_query(const float* query);
+    bool lookup_prepared(idx_t* entry_point, float* cosine_similarity);
+    void insert_prepared(idx_t top1_id);
+};
+
 /** The HNSW index is a normal random-access index with a HNSW
  * link structure built on top */
 
@@ -93,6 +135,31 @@ struct IndexHNSW : Index {
             idx_t* labels,
             const SearchParameters* params = nullptr) const;
 
+    /// Adaptive-light search from one supplied level-0 entry point per query.
+    /// The upper HNSW layers are not traversed.
+    void knn_query_adaptive_light_from_entry_points(
+            idx_t n,
+            const float* x,
+            const idx_t* entry_points,
+            idx_t k,
+            float* distances,
+            idx_t* labels,
+            const SearchParameters* params = nullptr) const;
+
+    /// Stateful temporal adaptive-light search over an ordered query stream.
+    /// Hits skip upper layers and start from the cached actual top-1 result.
+    void knn_query_adaptive_light_temporal(
+            idx_t n,
+            const float* x,
+            TemporalQueryCache* cache,
+            idx_t k,
+            float* distances,
+            idx_t* labels,
+            idx_t* history_hit_flags,
+            float* history_cosine_similarities,
+            idx_t* history_entry_points,
+            const SearchParameters* params = nullptr) const;
+
     void knn_query_adaptive_analysis(
             idx_t n,
             const float* x,
@@ -152,9 +219,10 @@ struct IndexHNSW : Index {
             float* sqrt_ef_dists,
             float* top_2k_dists,
             float* top_3k_dists,
+            float* rank_128_dists,
             const SearchParameters* params = nullptr) const;
 
-    void search_layer0_chr_summary(
+    void search_layer0_cfr_summary(
             idx_t n,
             const float* x,
             idx_t k,

@@ -67,9 +67,10 @@ struct SearchParametersHNSWAdaptiveLight : SearchParametersHNSW {
     float mid_easy_upper_gamma_ratio = std::numeric_limits<float>::quiet_NaN();
     int classify_start = 4;
     int classify_end = 16;
-    float chr_ema_decay = 0.8f;
+    float cfr_ema_decay = 0.8f;
     bool hard_stagnation_enabled = true;
     int hard_stagnation_count = 20;
+    float hard_stagnation_boundary_fraction = 1.0f;
     bool paper_bucket_mode = false;
     int paper_bucket_count = 4;
     float bucket_gamma_ratio_0 = std::numeric_limits<float>::quiet_NaN();
@@ -79,6 +80,21 @@ struct SearchParametersHNSWAdaptiveLight : SearchParametersHNSW {
     float bucket_gamma_ratio_4 = std::numeric_limits<float>::quiet_NaN();
     float bucket_gamma_ratio_5 = std::numeric_limits<float>::quiet_NaN();
     float bucket_gamma_ratio_6 = std::numeric_limits<float>::quiet_NaN();
+    bool shadow_stop_enabled = false;
+    int shadow_ef = 128;
+    float shadow_early_stop_ratio = std::numeric_limits<float>::quiet_NaN();
+    int shadow_stop_budget = 64;
+    bool shadow_two_tier_mode = false;
+    float shadow_low_gamma_ratio =
+            std::numeric_limits<float>::quiet_NaN();
+    int shadow_mid_stop_budget = 128;
+    bool shadow_bucket_mode = false;
+    float shadow_bucket_gamma_ratio_0 =
+            std::numeric_limits<float>::quiet_NaN();
+    float shadow_bucket_gamma_ratio_1 =
+            std::numeric_limits<float>::quiet_NaN();
+    float shadow_bucket_gamma_ratio_2 =
+            std::numeric_limits<float>::quiet_NaN();
 
     ~SearchParametersHNSWAdaptiveLight() {}
 };
@@ -233,6 +249,16 @@ struct HNSW {
             VisitedTable& vt,
             const SearchParametersHNSWAdaptiveLight* params = nullptr) const;
 
+    /// Run adaptive-light directly from a supplied level-0 entry point.
+    /// Unlike search_adaptive_light(), this skips upper-layer traversal.
+    HNSWStats search_adaptive_light_from_entry_point(
+            DistanceComputer& qdis,
+            const IndexHNSW* index,
+            ResultHandler& res,
+            VisitedTable& vt,
+            storage_idx_t external_entry_point,
+            const SearchParametersHNSWAdaptiveLight* params = nullptr) const;
+
     HNSWTargetHitStats search_first_target_hit_step(
             DistanceComputer& qdis,
             const IndexHNSW* index,
@@ -284,12 +310,14 @@ struct HNSWStats {
     size_t nhops = 0; /// number of hops aka number of edges traversed
     size_t hard_stagnation_stops =
             0; /// number of adaptive hard-stagnation stops
+    size_t shadow_stops = 0; /// number of shadow-CFR budget stops
 
     void reset() {
         n1 = n2 = 0;
         ndis = 0;
         nhops = 0;
         hard_stagnation_stops = 0;
+        shadow_stops = 0;
     }
 
     void combine(const HNSWStats& other) {
@@ -298,6 +326,7 @@ struct HNSWStats {
         ndis += other.ndis;
         nhops += other.nhops;
         hard_stagnation_stops += other.hard_stagnation_stops;
+        shadow_stops += other.shadow_stops;
     }
 };
 

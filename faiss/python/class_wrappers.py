@@ -63,6 +63,21 @@ def _selector_from_faiss_filter(filter_arg):
         "Python callables are not supported")
 
 
+def _prepare_hnsw_entry_points(index, entry_points, n):
+    entry_points = np.asarray(entry_points)
+    if entry_points.ndim == 0:
+        entry_points = entry_points.reshape(1)
+    if entry_points.ndim != 1 or entry_points.shape[0] != n:
+        raise ValueError(
+            "entry_points must contain exactly one entry point per query")
+    entry_points = np.ascontiguousarray(entry_points, dtype="int64")
+    if np.any(entry_points < 0) or np.any(entry_points >= index.ntotal):
+        raise ValueError(
+            "entry_points must contain valid internal ids in "
+            f"[0, {index.ntotal})")
+    return entry_points
+
+
 def _assign_paper_bucket_gamma_ratios(params, bucket_gamma_ratios):
     if int(params.paper_bucket_count) < 2 or int(params.paper_bucket_count) > 8:
         raise ValueError("paper_bucket_count must be in [2, 8]")
@@ -81,6 +96,23 @@ def _assign_paper_bucket_gamma_ratios(params, bucket_gamma_ratios):
         setattr(params, attr, np.nan)
     for i, value in enumerate(gamma_ratios):
         setattr(params, f"bucket_gamma_ratio_{i}", float(value))
+
+
+def _assign_shadow_bucket_gamma_ratios(params, shadow_bucket_gamma_ratios):
+    gamma_ratios = [float(value) for value in shadow_bucket_gamma_ratios]
+    if len(gamma_ratios) != 3:
+        raise ValueError(
+            "shadow_bucket_gamma_ratios must contain exactly 3 entries")
+    previous = -np.inf
+    for value in gamma_ratios:
+        if not np.isfinite(value) or value < 0.0 or value > 1.0:
+            raise ValueError("shadow_bucket_gamma_ratios must lie in [0, 1]")
+        if value < previous:
+            raise ValueError(
+                "shadow_bucket_gamma_ratios must be monotone nondecreasing")
+        previous = value
+    for i, value in enumerate(gamma_ratios):
+        setattr(params, f"shadow_bucket_gamma_ratio_{i}", float(value))
 
 
 def replace_method(the_class, name, replacement, ignore_missing=False):
@@ -499,9 +531,16 @@ def handle_Index(the_class):
             mid_easy_upper_gamma_ratio=np.nan,
             classify_start=4,
             classify_end=16,
-            chr_ema_decay=0.8,
+            cfr_ema_decay=0.8,
             hard_stagnation_enabled=True,
-            hard_stagnation_count=20):
+            hard_stagnation_count=20,
+            hard_stagnation_boundary_fraction=1.0,
+            shadow_stop_enabled=False,
+            shadow_ef=128,
+            shadow_early_stop_ratio=np.nan,
+            shadow_stop_budget=64,
+            shadow_bucket_mode=False,
+            shadow_bucket_gamma_ratios=()):
         """Python wrapper for the Faiss adaptive-light query API."""
 
         selector = _selector_from_faiss_filter(filter)
@@ -527,9 +566,18 @@ def handle_Index(the_class):
         params.mid_easy_upper_gamma_ratio = float(mid_easy_upper_gamma_ratio)
         params.classify_start = int(classify_start)
         params.classify_end = int(classify_end)
-        params.chr_ema_decay = float(chr_ema_decay)
+        params.cfr_ema_decay = float(cfr_ema_decay)
         params.hard_stagnation_enabled = bool(hard_stagnation_enabled)
         params.hard_stagnation_count = int(hard_stagnation_count)
+        params.hard_stagnation_boundary_fraction = float(hard_stagnation_boundary_fraction)
+        params.shadow_stop_enabled = bool(shadow_stop_enabled)
+        params.shadow_ef = int(shadow_ef)
+        params.shadow_early_stop_ratio = float(shadow_early_stop_ratio)
+        params.shadow_stop_budget = int(shadow_stop_budget)
+        params.shadow_bucket_mode = bool(shadow_bucket_mode)
+        if params.shadow_bucket_mode:
+            _assign_shadow_bucket_gamma_ratios(
+                params, shadow_bucket_gamma_ratios)
         params.bounded_queue = True
         params.sel = selector
 
@@ -547,6 +595,183 @@ def handle_Index(the_class):
 
         return I, D
 
+    def replacement_knn_query_adaptive_light_from_entry_points(
+            self,
+            x,
+            entry_points,
+            k=1,
+            ef_init=128,
+            enable_stop=True,
+            num_threads=-1,
+            filter=None,
+            early_stop_ratio=0.6,
+            tmin_pops=25,
+            super_easy_gamma_ratio=np.nan,
+            mid_easy_upper_gamma_ratio=np.nan,
+            classify_start=4,
+            classify_end=16,
+            cfr_ema_decay=0.8,
+            hard_stagnation_enabled=True,
+            hard_stagnation_count=20,
+            hard_stagnation_boundary_fraction=1.0,
+            shadow_stop_enabled=False,
+            shadow_ef=128,
+            shadow_early_stop_ratio=np.nan,
+            shadow_stop_budget=64,
+            shadow_bucket_mode=False,
+            shadow_bucket_gamma_ratios=()):
+        """Run adaptive-light from supplied level-0 entry points."""
+
+        selector = _selector_from_faiss_filter(filter)
+
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+
+        x = np.ascontiguousarray(x, dtype="float32")
+        entry_points = _prepare_hnsw_entry_points(self, entry_points, n)
+        D = np.empty((n, k), dtype=np.float32)
+        I = np.empty((n, k), dtype=np.int64)
+
+        params = faiss.SearchParametersHNSWAdaptiveLight()
+        params.efSearch = int(ef_init)
+        params.efMax = max(int(ef_init), 1024)
+        params.enable_stop = bool(enable_stop)
+        params.tmin_pops = int(tmin_pops)
+        params.early_stop_ratio = float(early_stop_ratio)
+        params.super_easy_gamma_ratio = float(super_easy_gamma_ratio)
+        params.mid_easy_upper_gamma_ratio = float(mid_easy_upper_gamma_ratio)
+        params.classify_start = int(classify_start)
+        params.classify_end = int(classify_end)
+        params.cfr_ema_decay = float(cfr_ema_decay)
+        params.hard_stagnation_enabled = bool(hard_stagnation_enabled)
+        params.hard_stagnation_count = int(hard_stagnation_count)
+        params.hard_stagnation_boundary_fraction = float(hard_stagnation_boundary_fraction)
+        params.shadow_stop_enabled = bool(shadow_stop_enabled)
+        params.shadow_ef = int(shadow_ef)
+        params.shadow_early_stop_ratio = float(shadow_early_stop_ratio)
+        params.shadow_stop_budget = int(shadow_stop_budget)
+        params.shadow_bucket_mode = bool(shadow_bucket_mode)
+        if params.shadow_bucket_mode:
+            _assign_shadow_bucket_gamma_ratios(
+                params, shadow_bucket_gamma_ratios)
+        params.bounded_queue = True
+        params.sel = selector
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.knn_query_adaptive_light_from_entry_points_c(
+                n,
+                swig_ptr(x),
+                swig_ptr(entry_points),
+                k,
+                swig_ptr(D),
+                swig_ptr(I),
+                params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return I, D
+
+    def replacement_knn_query_adaptive_light_temporal(
+            self,
+            x,
+            cache,
+            k=1,
+            ef_init=128,
+            enable_stop=True,
+            num_threads=-1,
+            filter=None,
+            early_stop_ratio=0.6,
+            tmin_pops=25,
+            super_easy_gamma_ratio=np.nan,
+            mid_easy_upper_gamma_ratio=np.nan,
+            classify_start=4,
+            classify_end=16,
+            cfr_ema_decay=0.8,
+            hard_stagnation_enabled=True,
+            hard_stagnation_count=20,
+            hard_stagnation_boundary_fraction=1.0,
+            shadow_stop_enabled=False,
+            shadow_ef=128,
+            shadow_early_stop_ratio=np.nan,
+            shadow_stop_budget=64,
+            shadow_bucket_mode=False,
+            shadow_bucket_gamma_ratios=()):
+        """Run stateful temporal adaptive-light over an ordered query batch."""
+
+        selector = _selector_from_faiss_filter(filter)
+
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+
+        x = np.ascontiguousarray(x, dtype="float32")
+        D = np.empty((n, k), dtype=np.float32)
+        I = np.empty((n, k), dtype=np.int64)
+        history_hits = np.empty((n,), dtype=np.int64)
+        history_cosines = np.empty((n,), dtype=np.float32)
+        history_entry_points = np.empty((n,), dtype=np.int64)
+
+        params = faiss.SearchParametersHNSWAdaptiveLight()
+        params.efSearch = int(ef_init)
+        params.efMax = max(int(ef_init), 1024)
+        params.enable_stop = bool(enable_stop)
+        params.tmin_pops = int(tmin_pops)
+        params.early_stop_ratio = float(early_stop_ratio)
+        params.super_easy_gamma_ratio = float(super_easy_gamma_ratio)
+        params.mid_easy_upper_gamma_ratio = float(mid_easy_upper_gamma_ratio)
+        params.classify_start = int(classify_start)
+        params.classify_end = int(classify_end)
+        params.cfr_ema_decay = float(cfr_ema_decay)
+        params.hard_stagnation_enabled = bool(hard_stagnation_enabled)
+        params.hard_stagnation_count = int(hard_stagnation_count)
+        params.hard_stagnation_boundary_fraction = float(hard_stagnation_boundary_fraction)
+        params.shadow_stop_enabled = bool(shadow_stop_enabled)
+        params.shadow_ef = int(shadow_ef)
+        params.shadow_early_stop_ratio = float(shadow_early_stop_ratio)
+        params.shadow_stop_budget = int(shadow_stop_budget)
+        params.shadow_bucket_mode = bool(shadow_bucket_mode)
+        if params.shadow_bucket_mode:
+            _assign_shadow_bucket_gamma_ratios(
+                params, shadow_bucket_gamma_ratios)
+        params.bounded_queue = True
+        params.sel = selector
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.knn_query_adaptive_light_temporal_c(
+                n,
+                swig_ptr(x),
+                cache,
+                k,
+                swig_ptr(D),
+                swig_ptr(I),
+                swig_ptr(history_hits),
+                swig_ptr(history_cosines),
+                swig_ptr(history_entry_points),
+                params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return I, D, history_hits, history_cosines, history_entry_points
+
     def replacement_knn_query_adaptive_light_paper_bucket(
             self,
             x,
@@ -561,9 +786,19 @@ def handle_Index(the_class):
             bucket_gamma_ratios=(),
             classify_start=4,
             classify_end=16,
-            chr_ema_decay=0.8,
+            cfr_ema_decay=0.8,
             hard_stagnation_enabled=True,
-            hard_stagnation_count=20):
+            hard_stagnation_count=20,
+            hard_stagnation_boundary_fraction=1.0,
+            shadow_stop_enabled=False,
+            shadow_ef=128,
+            shadow_early_stop_ratio=np.nan,
+            shadow_stop_budget=64,
+            shadow_two_tier_mode=False,
+            shadow_low_gamma_ratio=np.nan,
+            shadow_mid_stop_budget=128,
+            shadow_bucket_mode=False,
+            shadow_bucket_gamma_ratios=()):
         """Python wrapper for the Faiss paper-bucket adaptive-light query API."""
 
         selector = _selector_from_faiss_filter(filter)
@@ -587,9 +822,21 @@ def handle_Index(the_class):
         params.early_stop_ratio = float(early_stop_ratio)
         params.classify_start = int(classify_start)
         params.classify_end = int(classify_end)
-        params.chr_ema_decay = float(chr_ema_decay)
+        params.cfr_ema_decay = float(cfr_ema_decay)
         params.hard_stagnation_enabled = bool(hard_stagnation_enabled)
         params.hard_stagnation_count = int(hard_stagnation_count)
+        params.hard_stagnation_boundary_fraction = float(hard_stagnation_boundary_fraction)
+        params.shadow_stop_enabled = bool(shadow_stop_enabled)
+        params.shadow_ef = int(shadow_ef)
+        params.shadow_early_stop_ratio = float(shadow_early_stop_ratio)
+        params.shadow_stop_budget = int(shadow_stop_budget)
+        params.shadow_two_tier_mode = bool(shadow_two_tier_mode)
+        params.shadow_low_gamma_ratio = float(shadow_low_gamma_ratio)
+        params.shadow_mid_stop_budget = int(shadow_mid_stop_budget)
+        params.shadow_bucket_mode = bool(shadow_bucket_mode)
+        if params.shadow_bucket_mode:
+            _assign_shadow_bucket_gamma_ratios(
+                params, shadow_bucket_gamma_ratios)
         params.bounded_queue = True
         params.paper_bucket_mode = True
         params.paper_bucket_count = int(paper_bucket_count)
@@ -610,6 +857,185 @@ def handle_Index(the_class):
 
         return I, D
 
+    def replacement_knn_query_adaptive_light_from_entry_points_paper_bucket(
+            self,
+            x,
+            entry_points,
+            k=1,
+            ef_init=128,
+            enable_stop=True,
+            num_threads=-1,
+            filter=None,
+            early_stop_ratio=0.6,
+            tmin_pops=25,
+            paper_bucket_count=4,
+            bucket_gamma_ratios=(),
+            classify_start=4,
+            classify_end=16,
+            cfr_ema_decay=0.8,
+            hard_stagnation_enabled=True,
+            hard_stagnation_count=20,
+            hard_stagnation_boundary_fraction=1.0,
+            shadow_stop_enabled=False,
+            shadow_ef=128,
+            shadow_early_stop_ratio=np.nan,
+            shadow_stop_budget=64,
+            shadow_bucket_mode=False,
+            shadow_bucket_gamma_ratios=()):
+        """Run paper-bucket adaptive-light from supplied level-0 entries."""
+
+        selector = _selector_from_faiss_filter(filter)
+
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+
+        x = np.ascontiguousarray(x, dtype="float32")
+        entry_points = _prepare_hnsw_entry_points(self, entry_points, n)
+        D = np.empty((n, k), dtype=np.float32)
+        I = np.empty((n, k), dtype=np.int64)
+
+        params = faiss.SearchParametersHNSWAdaptiveLight()
+        params.efSearch = int(ef_init)
+        params.efMax = max(int(ef_init), 1024)
+        params.enable_stop = bool(enable_stop)
+        params.tmin_pops = int(tmin_pops)
+        params.early_stop_ratio = float(early_stop_ratio)
+        params.classify_start = int(classify_start)
+        params.classify_end = int(classify_end)
+        params.cfr_ema_decay = float(cfr_ema_decay)
+        params.hard_stagnation_enabled = bool(hard_stagnation_enabled)
+        params.hard_stagnation_count = int(hard_stagnation_count)
+        params.hard_stagnation_boundary_fraction = float(hard_stagnation_boundary_fraction)
+        params.shadow_stop_enabled = bool(shadow_stop_enabled)
+        params.shadow_ef = int(shadow_ef)
+        params.shadow_early_stop_ratio = float(shadow_early_stop_ratio)
+        params.shadow_stop_budget = int(shadow_stop_budget)
+        params.shadow_bucket_mode = bool(shadow_bucket_mode)
+        if params.shadow_bucket_mode:
+            _assign_shadow_bucket_gamma_ratios(
+                params, shadow_bucket_gamma_ratios)
+        params.bounded_queue = True
+        params.paper_bucket_mode = True
+        params.paper_bucket_count = int(paper_bucket_count)
+        params.sel = selector
+        _assign_paper_bucket_gamma_ratios(params, bucket_gamma_ratios)
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.knn_query_adaptive_light_from_entry_points_c(
+                n,
+                swig_ptr(x),
+                swig_ptr(entry_points),
+                k,
+                swig_ptr(D),
+                swig_ptr(I),
+                params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return I, D
+
+    def replacement_knn_query_adaptive_light_temporal_paper_bucket(
+            self,
+            x,
+            cache,
+            k=1,
+            ef_init=128,
+            enable_stop=True,
+            num_threads=-1,
+            filter=None,
+            early_stop_ratio=0.6,
+            tmin_pops=25,
+            paper_bucket_count=4,
+            bucket_gamma_ratios=(),
+            classify_start=4,
+            classify_end=16,
+            cfr_ema_decay=0.8,
+            hard_stagnation_enabled=True,
+            hard_stagnation_count=20,
+            hard_stagnation_boundary_fraction=1.0,
+            shadow_stop_enabled=False,
+            shadow_ef=128,
+            shadow_early_stop_ratio=np.nan,
+            shadow_stop_budget=64,
+            shadow_bucket_mode=False,
+            shadow_bucket_gamma_ratios=()):
+        """Run stateful temporal paper-bucket adaptive-light search."""
+
+        selector = _selector_from_faiss_filter(filter)
+
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        n, d = x.shape
+        assert d == self.d
+        assert k > 0
+
+        x = np.ascontiguousarray(x, dtype="float32")
+        D = np.empty((n, k), dtype=np.float32)
+        I = np.empty((n, k), dtype=np.int64)
+        history_hits = np.empty((n,), dtype=np.int64)
+        history_cosines = np.empty((n,), dtype=np.float32)
+        history_entry_points = np.empty((n,), dtype=np.int64)
+
+        params = faiss.SearchParametersHNSWAdaptiveLight()
+        params.efSearch = int(ef_init)
+        params.efMax = max(int(ef_init), 1024)
+        params.enable_stop = bool(enable_stop)
+        params.tmin_pops = int(tmin_pops)
+        params.early_stop_ratio = float(early_stop_ratio)
+        params.classify_start = int(classify_start)
+        params.classify_end = int(classify_end)
+        params.cfr_ema_decay = float(cfr_ema_decay)
+        params.hard_stagnation_enabled = bool(hard_stagnation_enabled)
+        params.hard_stagnation_count = int(hard_stagnation_count)
+        params.hard_stagnation_boundary_fraction = float(hard_stagnation_boundary_fraction)
+        params.shadow_stop_enabled = bool(shadow_stop_enabled)
+        params.shadow_ef = int(shadow_ef)
+        params.shadow_early_stop_ratio = float(shadow_early_stop_ratio)
+        params.shadow_stop_budget = int(shadow_stop_budget)
+        params.shadow_bucket_mode = bool(shadow_bucket_mode)
+        if params.shadow_bucket_mode:
+            _assign_shadow_bucket_gamma_ratios(
+                params, shadow_bucket_gamma_ratios)
+        params.bounded_queue = True
+        params.paper_bucket_mode = True
+        params.paper_bucket_count = int(paper_bucket_count)
+        params.sel = selector
+        _assign_paper_bucket_gamma_ratios(params, bucket_gamma_ratios)
+
+        prev_num_threads = None
+        if num_threads is not None and int(num_threads) > 0:
+            prev_num_threads = faiss.omp_get_max_threads()
+            faiss.omp_set_num_threads(int(num_threads))
+
+        try:
+            self.knn_query_adaptive_light_temporal_c(
+                n,
+                swig_ptr(x),
+                cache,
+                k,
+                swig_ptr(D),
+                swig_ptr(I),
+                swig_ptr(history_hits),
+                swig_ptr(history_cosines),
+                swig_ptr(history_entry_points),
+                params)
+        finally:
+            if prev_num_threads is not None:
+                faiss.omp_set_num_threads(int(prev_num_threads))
+
+        return I, D, history_hits, history_cosines, history_entry_points
+
     def replacement_knn_query_adaptive_analysis(
             self,
             x,
@@ -625,10 +1051,17 @@ def handle_Index(the_class):
             bucket_gamma_ratios=(),
             classify_start=4,
             classify_end=16,
-            chr_ema_decay=0.8,
+            cfr_ema_decay=0.8,
             hard_stagnation_enabled=True,
-            hard_stagnation_count=20):
-        """Return labels plus per-query adaptive hard-stagnation analysis stats."""
+            hard_stagnation_count=20,
+            hard_stagnation_boundary_fraction=1.0,
+            shadow_stop_enabled=False,
+            shadow_ef=128,
+            shadow_early_stop_ratio=np.nan,
+            shadow_stop_budget=64,
+            shadow_bucket_mode=False,
+            shadow_bucket_gamma_ratios=()):
+        """Return labels plus per-query adaptive/shadow stop analysis stats."""
 
         selector = _selector_from_faiss_filter(filter)
 
@@ -657,9 +1090,18 @@ def handle_Index(the_class):
         params.early_stop_ratio = float(early_stop_ratio)
         params.classify_start = int(classify_start)
         params.classify_end = int(classify_end)
-        params.chr_ema_decay = float(chr_ema_decay)
+        params.cfr_ema_decay = float(cfr_ema_decay)
         params.hard_stagnation_enabled = bool(hard_stagnation_enabled)
         params.hard_stagnation_count = int(hard_stagnation_count)
+        params.hard_stagnation_boundary_fraction = float(hard_stagnation_boundary_fraction)
+        params.shadow_stop_enabled = bool(shadow_stop_enabled)
+        params.shadow_ef = int(shadow_ef)
+        params.shadow_early_stop_ratio = float(shadow_early_stop_ratio)
+        params.shadow_stop_budget = int(shadow_stop_budget)
+        params.shadow_bucket_mode = bool(shadow_bucket_mode)
+        if params.shadow_bucket_mode:
+            _assign_shadow_bucket_gamma_ratios(
+                params, shadow_bucket_gamma_ratios)
         params.bounded_queue = True
         params.paper_bucket_mode = True
         params.paper_bucket_count = int(paper_bucket_count)
@@ -788,7 +1230,10 @@ def handle_Index(the_class):
             hide_labels=None,
             max_steps=0,
             num_threads=-1,
-            filter=None):
+            filter=None,
+            classify_start=4,
+            classify_end=16,
+            cfr_ema_decay=0.8):
         """Return native Faiss level-0 trace arrays for SAGE calibration."""
 
         selector = _selector_from_faiss_filter(filter)
@@ -822,7 +1267,7 @@ def handle_Index(the_class):
         params.efSearch = int(ef)
         params.classify_start = int(classify_start)
         params.classify_end = int(classify_end)
-        params.chr_ema_decay = float(chr_ema_decay)
+        params.cfr_ema_decay = float(cfr_ema_decay)
         params.sel = selector
 
         def run_once(active_max_steps):
@@ -857,6 +1302,7 @@ def handle_Index(the_class):
                 sqrt_ef_dists = np.full(shape, np.nan, dtype=np.float32)
                 top_2k_dists = np.full(shape, np.nan, dtype=np.float32)
                 top_3k_dists = np.full(shape, np.nan, dtype=np.float32)
+                rank_128_dists = np.full(shape, np.nan, dtype=np.float32)
 
                 chunk_x = np.ascontiguousarray(x[start:stop], dtype="float32")
                 chunk_hidden = np.ascontiguousarray(hidden[start:stop], dtype=np.int64)
@@ -892,6 +1338,7 @@ def handle_Index(the_class):
                     swig_ptr(sqrt_ef_dists),
                     swig_ptr(top_2k_dists),
                     swig_ptr(top_3k_dists),
+                    swig_ptr(rank_128_dists),
                     params)
                 chunks.append({
                     "step_counts": step_counts,
@@ -919,6 +1366,7 @@ def handle_Index(the_class):
                     "sqrt_ef_dists": sqrt_ef_dists,
                     "top_2k_dists": top_2k_dists,
                     "top_3k_dists": top_3k_dists,
+                    "rank_128_dists": rank_128_dists,
                 })
             keys = chunks[0].keys()
             return {key: np.concatenate([chunk[key] for chunk in chunks], axis=0) for key in keys}
@@ -940,7 +1388,7 @@ def handle_Index(the_class):
             if prev_num_threads is not None:
                 faiss.omp_set_num_threads(int(prev_num_threads))
 
-    def replacement_search_layer0_chr_summary(
+    def replacement_search_layer0_cfr_summary(
             self,
             x,
             k=10,
@@ -950,8 +1398,8 @@ def handle_Index(the_class):
             filter=None,
             classify_start=4,
             classify_end=16,
-            chr_ema_decay=0.8):
-        """Return native Faiss per-query CHR window summaries for SAGE calibration."""
+            cfr_ema_decay=0.8):
+        """Return native Faiss per-query CFR window summaries for SAGE calibration."""
 
         selector = _selector_from_faiss_filter(filter)
         x = np.asarray(x)
@@ -984,8 +1432,11 @@ def handle_Index(the_class):
         mean_smoothed_cfrs = np.full(n, np.nan, dtype=np.float32)
         closest_dists = np.full(n, np.inf, dtype=np.float32)
 
-        params = faiss.SearchParametersHNSW()
+        params = faiss.SearchParametersHNSWAdaptiveLight()
         params.efSearch = int(ef)
+        params.classify_start = int(classify_start)
+        params.classify_end = int(classify_end)
+        params.cfr_ema_decay = float(cfr_ema_decay)
         params.sel = selector
 
         prev_num_threads = None
@@ -994,7 +1445,7 @@ def handle_Index(the_class):
             faiss.omp_set_num_threads(int(num_threads))
 
         try:
-            self.search_layer0_chr_summary_c(
+            self.search_layer0_cfr_summary_c(
                 n,
                 swig_ptr(x),
                 int(k),
@@ -1554,6 +2005,12 @@ def handle_Index(the_class):
     replace_method(the_class, 'search', replacement_search)
     replace_method(the_class, 'knn_query_adaptive_light',
                    replacement_knn_query_adaptive_light, ignore_missing=True)
+    replace_method(the_class, 'knn_query_adaptive_light_from_entry_points',
+                   replacement_knn_query_adaptive_light_from_entry_points,
+                   ignore_missing=True)
+    replace_method(the_class, 'knn_query_adaptive_light_temporal',
+                   replacement_knn_query_adaptive_light_temporal,
+                   ignore_missing=True)
     replace_method(the_class, 'knn_query_adaptive_analysis',
                    replacement_knn_query_adaptive_analysis,
                    ignore_missing=True)
@@ -1563,11 +2020,27 @@ def handle_Index(the_class):
                    replacement_compute_internal_lids, ignore_missing=True)
     replace_method(the_class, 'search_layer0_trace',
                    replacement_search_layer0_trace, ignore_missing=True)
-    replace_method(the_class, 'search_layer0_chr_summary',
-                   replacement_search_layer0_chr_summary, ignore_missing=True)
+    replace_method(the_class, 'search_layer0_cfr_summary',
+                   replacement_search_layer0_cfr_summary, ignore_missing=True)
     if hasattr(the_class, "knn_query_adaptive_light_c"):
         setattr(the_class, "knn_query_adaptive_light_paper_bucket",
                 replacement_knn_query_adaptive_light_paper_bucket)
+    if hasattr(the_class, "knn_query_adaptive_light_from_entry_points_c"):
+        setattr(the_class, "knn_query_adaptive_light_from_entry_points_paper_bucket",
+                replacement_knn_query_adaptive_light_from_entry_points_paper_bucket)
+        setattr(the_class, "knn_query_sage_from_entry_points",
+                replacement_knn_query_adaptive_light_from_entry_points_paper_bucket)
+    if hasattr(the_class, "knn_query_adaptive_light_temporal_c"):
+        setattr(the_class, "knn_query_adaptive_light_query_locality",
+                replacement_knn_query_adaptive_light_temporal)
+        setattr(the_class, "knn_query_adaptive_light_temporal_paper_bucket",
+                replacement_knn_query_adaptive_light_temporal_paper_bucket)
+        setattr(the_class, "knn_query_adaptive_light_query_locality_paper_bucket",
+                replacement_knn_query_adaptive_light_temporal_paper_bucket)
+        setattr(the_class, "knn_query_sage_temporal",
+                replacement_knn_query_adaptive_light_temporal_paper_bucket)
+        setattr(the_class, "knn_query_sage_query_locality",
+                replacement_knn_query_adaptive_light_temporal_paper_bucket)
     if hasattr(the_class, "knn_query_adaptive_analysis_c"):
         setattr(the_class, "knn_query_adaptive_analysis_paper_bucket",
                 replacement_knn_query_adaptive_analysis)

@@ -725,6 +725,64 @@ static inline size_t resolve_paper_bucket_shrink_ef(
     return std::max(routed_ef, k);
 }
 
+static inline float get_shadow_bucket_gamma_ratio(
+        const SearchParametersHNSWAdaptiveLight& params,
+        size_t index) {
+    switch (index) {
+        case 0:
+            return params.shadow_bucket_gamma_ratio_0;
+        case 1:
+            return params.shadow_bucket_gamma_ratio_1;
+        case 2:
+            return params.shadow_bucket_gamma_ratio_2;
+        default:
+            return std::numeric_limits<float>::quiet_NaN();
+    }
+}
+
+static inline void validate_shadow_bucket_routing_config(
+        const SearchParametersHNSWAdaptiveLight& params) {
+    float prev_gamma = -std::numeric_limits<float>::infinity();
+    for (size_t i = 0; i < 3; i++) {
+        const float gamma = get_shadow_bucket_gamma_ratio(params, i);
+        FAISS_THROW_IF_NOT_MSG(
+                std::isfinite(gamma),
+                "shadow_bucket_gamma_ratios must be finite");
+        FAISS_THROW_IF_NOT_MSG(
+                gamma >= 0.0f && gamma <= 1.0f,
+                "shadow_bucket_gamma_ratios must lie in [0, 1]");
+        FAISS_THROW_IF_NOT_MSG(
+                gamma >= prev_gamma,
+                "shadow_bucket_gamma_ratios must be monotone nondecreasing");
+        prev_gamma = gamma;
+    }
+}
+
+static inline size_t resolve_shadow_bucket_shrink_ef(
+        size_t configured_ef,
+        size_t shadow_rank,
+        size_t k,
+        const SearchParametersHNSWAdaptiveLight& params,
+        float shadow_cfr_ratio) {
+    validate_shadow_bucket_routing_config(params);
+
+    size_t selected_bucket_index = 3;
+    for (size_t i = 0; i < 3; i++) {
+        if (shadow_cfr_ratio <= get_shadow_bucket_gamma_ratio(params, i)) {
+            selected_bucket_index = i;
+            break;
+        }
+    }
+    if (selected_bucket_index >= 3) {
+        return configured_ef;
+    }
+
+    size_t routed_ef = (shadow_rank * (selected_bucket_index + 1)) / 4;
+    routed_ef = std::max<size_t>(1, routed_ef);
+    routed_ef = std::min(configured_ef, routed_ef);
+    return std::max(routed_ef, k);
+}
+
 static inline void shrink_minimax_heap_capacity(
         MinimaxHeap& candidates,
         size_t new_capacity) {
@@ -741,6 +799,72 @@ static inline void shrink_minimax_heap_capacity(
         heap_pop<MinimaxHeap::HC>(
                 candidates.k--, candidates.dis.data(), candidates.ids.data());
     }
+}
+
+
+static inline float minimax_heap_rank_boundary(
+        const MinimaxHeap& candidates,
+        size_t rank) {
+    const size_t valid_count =
+            static_cast<size_t>(std::max(candidates.nvalid, 0));
+    if (candidates.k <= 0 || valid_count == 0) {
+        return std::numeric_limits<float>::max();
+    }
+
+    rank = std::max<size_t>(1, rank);
+    if (rank >= valid_count) {
+        return candidates.max();
+    }
+
+    std::vector<float> distances;
+    distances.reserve(valid_count);
+    for (int i = 0; i < candidates.k; i++) {
+        if (candidates.ids[i] != -1) {
+            distances.push_back(candidates.dis[i]);
+        }
+    }
+    if (distances.empty()) {
+        return std::numeric_limits<float>::max();
+    }
+
+    rank = std::min(rank, distances.size());
+    auto nth = distances.begin() + static_cast<std::ptrdiff_t>(rank - 1);
+    std::nth_element(distances.begin(), nth, distances.end());
+    return *nth;
+}
+
+static inline float minimax_heap_rank_boundary_or_nan(
+        const MinimaxHeap& candidates,
+        size_t rank) {
+    rank = std::max<size_t>(1, rank);
+    if (candidates.nvalid < static_cast<int>(rank)) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+
+    std::vector<float> distances;
+    distances.reserve(static_cast<size_t>(std::max(candidates.nvalid, 0)));
+    for (int i = 0; i < candidates.k; i++) {
+        if (candidates.ids[i] != -1) {
+            distances.push_back(candidates.dis[i]);
+        }
+    }
+    if (distances.size() < rank) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+
+    auto nth = distances.begin() + static_cast<std::ptrdiff_t>(rank - 1);
+    std::nth_element(distances.begin(), nth, distances.end());
+    return *nth;
+}
+
+static inline size_t resolve_stagnation_boundary_rank(
+        size_t ef_cur,
+        float boundary_fraction) {
+    const float fraction = std::isfinite(boundary_fraction)
+            ? std::min(std::max(boundary_fraction, 0.0f), 1.0f)
+            : 1.0f;
+    return std::max<size_t>(
+            1, static_cast<size_t>(std::ceil(ef_cur * fraction)));
 }
 
 static inline size_t count_target_hits_in_top_candidates(
@@ -953,20 +1077,27 @@ int search_from_candidates_adaptive_light(
             params.classify_start,
             params.classify_end);
     FAISS_THROW_IF_NOT_MSG(
-            std::isfinite(params.chr_ema_decay) &&
-                    params.chr_ema_decay >= 0.0f &&
-                    params.chr_ema_decay <= 1.0f,
-            "chr_ema_decay must be finite and lie in [0, 1]");
+            std::isfinite(params.cfr_ema_decay) &&
+                    params.cfr_ema_decay >= 0.0f &&
+                    params.cfr_ema_decay <= 1.0f,
+            "cfr_ema_decay must be finite and lie in [0, 1]");
     FAISS_THROW_IF_NOT_FMT(
             params.hard_stagnation_count >= 1,
             "hard_stagnation_count must be >= 1, got %d",
             params.hard_stagnation_count);
+    FAISS_THROW_IF_NOT_MSG(
+            std::isfinite(params.hard_stagnation_boundary_fraction) &&
+                    params.hard_stagnation_boundary_fraction > 0.0f &&
+                    params.hard_stagnation_boundary_fraction <= 1.0f,
+            "hard_stagnation_boundary_fraction must be finite and lie in (0, 1]");
 
     const size_t hard_only_stag_limit =
             static_cast<size_t>(params.hard_stagnation_count);
+    const float hard_stagnation_boundary_fraction =
+            params.hard_stagnation_boundary_fraction;
     const int classify_start = params.classify_start;
     const int classify_end = params.classify_end;
-    const float cfr_ema_decay = params.chr_ema_decay;
+    const float cfr_ema_decay = params.cfr_ema_decay;
     const float cfr_ema_update = 1.0f - cfr_ema_decay;
 
     FAISS_THROW_IF_NOT_MSG(
@@ -983,6 +1114,54 @@ int search_from_candidates_adaptive_light(
             ef_cur,
             std::max<size_t>(static_cast<size_t>(params.efMax), 1));
     const size_t configured_ef_cur = ef_cur;
+    const bool shadow_classifier_enabled =
+            params.shadow_stop_enabled &&
+            std::isfinite(params.shadow_early_stop_ratio);
+    const bool shadow_bucket_classifier_enabled =
+            shadow_classifier_enabled && params.shadow_bucket_mode;
+    const bool shadow_two_tier_classifier_enabled =
+            shadow_classifier_enabled && params.shadow_two_tier_mode &&
+            !shadow_bucket_classifier_enabled;
+    const size_t shadow_rank = std::max<size_t>(
+            1, static_cast<size_t>(std::max(params.shadow_ef, 1)));
+    const size_t shadow_stop_budget = std::max<size_t>(
+            1, static_cast<size_t>(std::max(params.shadow_stop_budget, 1)));
+    const size_t shadow_mid_stop_budget = std::max<size_t>(
+            1, static_cast<size_t>(std::max(params.shadow_mid_stop_budget, 1)));
+    if (shadow_classifier_enabled) {
+        FAISS_THROW_IF_NOT_FMT(
+                shadow_rank >= static_cast<size_t>(k_search),
+                "shadow_ef must be >= k, got shadow_ef=%d k=%d",
+                params.shadow_ef,
+                k_search);
+        FAISS_THROW_IF_NOT_FMT(
+                shadow_rank <= configured_ef_cur,
+                "shadow_ef must be <= configured ef, got shadow_ef=%d ef=%zu",
+                params.shadow_ef,
+                configured_ef_cur);
+        FAISS_THROW_IF_NOT_MSG(
+                params.shadow_early_stop_ratio >= 0.0f,
+                "shadow_early_stop_ratio must be non-negative");
+        if (shadow_bucket_classifier_enabled) {
+            validate_shadow_bucket_routing_config(params);
+        } else if (shadow_two_tier_classifier_enabled) {
+            FAISS_THROW_IF_NOT_MSG(
+                    std::isfinite(params.shadow_low_gamma_ratio) &&
+                            params.shadow_low_gamma_ratio >= 0.0f &&
+                            params.shadow_low_gamma_ratio <= 1.0f,
+                    "shadow_low_gamma_ratio must be finite and lie in [0, 1]");
+            FAISS_THROW_IF_NOT_FMT(
+                    shadow_stop_budget <= shadow_mid_stop_budget,
+                    "shadow low stop budget must be <= mid stop budget, got low=%zu mid=%zu",
+                    shadow_stop_budget,
+                    shadow_mid_stop_budget);
+            FAISS_THROW_IF_NOT_FMT(
+                    shadow_mid_stop_budget <= configured_ef_cur,
+                    "shadow mid stop budget must be <= configured ef, got mid=%zu ef=%zu",
+                    shadow_mid_stop_budget,
+                    configured_ef_cur);
+        }
+    }
 
     bool is_easy_query = false;
     bool is_super_easy_query = false;
@@ -992,11 +1171,20 @@ int search_from_candidates_adaptive_light(
     int full_pop_count = 0;
     int stagnation_count = 0;
     bool stopped_by_hard_stagnation = false;
+    bool stopped_by_shadow = false;
     float prev_furthest = std::numeric_limits<float>::max();
     float smoothed_cfr_ema = std::numeric_limits<float>::quiet_NaN();
     float classify_smoothed_cfr_sum = 0.0f;
     int classify_smoothed_cfr_count = 0;
     float classify_cfr_mean = std::numeric_limits<float>::quiet_NaN();
+    size_t shadow_full_pop_count = 0;
+    bool shadow_classification_evaluated = false;
+    bool shadow_is_easy_query = false;
+    size_t shadow_decision_step = 0;
+    size_t shadow_selected_stop_budget = shadow_stop_budget;
+    float shadow_smoothed_cfr_ema = std::numeric_limits<float>::quiet_NaN();
+    float shadow_classify_smoothed_cfr_sum = 0.0f;
+    int shadow_classify_smoothed_cfr_count = 0;
     const bool direct_classifier_threshold_enabled =
             std::isfinite(params.early_stop_ratio);
     if (params.paper_bucket_mode) {
@@ -1014,7 +1202,11 @@ int search_from_candidates_adaptive_light(
             : params.tmin_pops;
 
     MinimaxHeap candidates(static_cast<int>(configured_ef_cur));
+    MinimaxHeap shadow_candidates(static_cast<int>(shadow_rank));
     candidates.push(nearest, d_nearest);
+    if (shadow_classifier_enabled && (!sel || sel->is_member(nearest))) {
+        shadow_candidates.push(nearest, d_nearest);
+    }
     vt.set(nearest);
 
     C::T threshold = res.threshold;
@@ -1027,7 +1219,11 @@ int search_from_candidates_adaptive_light(
     int ndis = 0;
     int nstep = 0;
 
-    auto add_to_heap = [&](const storage_idx_t idx, const float dis) {
+    auto shadow_tracking_active = [&]() -> bool {
+        return shadow_classifier_enabled && !shadow_classification_evaluated;
+    };
+
+    auto add_to_heap_plain = [&](const storage_idx_t idx, const float dis) {
         if (!sel || sel->is_member(idx)) {
             if (dis < threshold) {
                 if (res.add_result(dis, idx)) {
@@ -1036,6 +1232,263 @@ int search_from_candidates_adaptive_light(
             }
         }
         candidates.push(idx, dis);
+    };
+
+    auto should_push_shadow_candidate = [&](const float dis) -> bool {
+        if (shadow_candidates.k >= static_cast<int>(shadow_rank) &&
+            dis >= shadow_candidates.max()) {
+            return false;
+        }
+        return true;
+    };
+
+    auto add_to_heap_with_shadow =
+            [&](const storage_idx_t idx, const float dis) {
+        const bool selected = !sel || sel->is_member(idx);
+        if (selected) {
+            if (dis < threshold) {
+                if (res.add_result(dis, idx)) {
+                    threshold = res.threshold;
+                }
+            }
+        }
+        candidates.push(idx, dis);
+        if (selected && should_push_shadow_candidate(dis)) {
+            shadow_candidates.push(idx, dis);
+        }
+    };
+
+    auto observe_shadow_cfr_after_expansion =
+            [&](const float candidate_dist, const size_t current_step) {
+        if (!shadow_classifier_enabled || shadow_classification_evaluated) {
+            return;
+        }
+        if (shadow_candidates.k < static_cast<int>(shadow_rank)) {
+            return;
+        }
+        const float shadow_boundary_raw = shadow_candidates.max();
+        const float shadow_boundary_dist =
+                raw_distance_to_external_distance(
+                        shadow_boundary_raw, similarity_metric);
+        if (!std::isfinite(shadow_boundary_dist) ||
+            std::fabs(shadow_boundary_dist) <= 1e-6f) {
+            return;
+        }
+
+        shadow_full_pop_count++;
+        const float candidate_dist_external =
+                raw_distance_to_external_distance(
+                        candidate_dist, similarity_metric);
+        const float cfr = candidate_dist_external /
+                std::max(shadow_boundary_dist, 1e-6f);
+        if (std::isnan(shadow_smoothed_cfr_ema)) {
+            shadow_smoothed_cfr_ema = cfr;
+        } else {
+            shadow_smoothed_cfr_ema =
+                    cfr_ema_decay * shadow_smoothed_cfr_ema +
+                    cfr_ema_update * cfr;
+        }
+
+        if (shadow_full_pop_count >= static_cast<size_t>(classify_start) &&
+            shadow_full_pop_count <= static_cast<size_t>(classify_end)) {
+            shadow_classify_smoothed_cfr_sum += shadow_smoothed_cfr_ema;
+            shadow_classify_smoothed_cfr_count++;
+        }
+        if (shadow_full_pop_count >= static_cast<size_t>(classify_end)) {
+            shadow_classification_evaluated = true;
+            shadow_decision_step = current_step;
+            if (shadow_classify_smoothed_cfr_count > 0) {
+                const float shadow_cfr_mean =
+                        shadow_classify_smoothed_cfr_sum /
+                        static_cast<float>(
+                                shadow_classify_smoothed_cfr_count);
+                if (shadow_bucket_classifier_enabled) {
+                    const float shadow_cfr_ratio = shadow_cfr_mean /
+                            std::max(params.shadow_early_stop_ratio, 1e-6f);
+                    const size_t shadow_routed_ef =
+                            resolve_shadow_bucket_shrink_ef(
+                                    configured_ef_cur,
+                                    shadow_rank,
+                                    static_cast<size_t>(k_search),
+                                    params,
+                                    shadow_cfr_ratio);
+                    shadow_is_easy_query =
+                            shadow_routed_ef < configured_ef_cur;
+                    if (shadow_is_easy_query && shadow_routed_ef < ef_cur) {
+                        ef_cur = shadow_routed_ef;
+                        shrink_minimax_heap_capacity(candidates, ef_cur);
+                        classification_evaluated = true;
+                        effective_ef_shrink_applied = true;
+                        stopped_by_shadow = true;
+                    }
+                } else {
+                    shadow_is_easy_query =
+                            shadow_cfr_mean <= params.shadow_early_stop_ratio;
+                    if (shadow_is_easy_query &&
+                        shadow_two_tier_classifier_enabled) {
+                        const float shadow_cfr_ratio = shadow_cfr_mean /
+                                std::max(params.shadow_early_stop_ratio, 1e-6f);
+                        shadow_selected_stop_budget = shadow_cfr_ratio <=
+                                        params.shadow_low_gamma_ratio
+                                ? shadow_stop_budget
+                                : shadow_mid_stop_budget;
+                    }
+                }
+            }
+            shadow_candidates.clear();
+        }
+    };
+
+    auto observe_cfr_full_pop =
+            [&](const float candidate_dist,
+                const float cfr_denominator_dist) -> bool {
+        full_pop_count++;
+        size_t stagnation_boundary_rank = resolve_stagnation_boundary_rank(
+                ef_cur, hard_stagnation_boundary_fraction);
+        float stagnation_boundary_dist = raw_distance_to_external_distance(
+                minimax_heap_rank_boundary(candidates, stagnation_boundary_rank),
+                similarity_metric);
+        const float candidate_dist_external =
+                raw_distance_to_external_distance(
+                        candidate_dist,
+                        similarity_metric);
+        const float cfr = candidate_dist_external /
+                std::max(cfr_denominator_dist, 1e-6f);
+        bool rebased_after_shrink = false;
+
+        if (std::isnan(smoothed_cfr_ema)) {
+            smoothed_cfr_ema = cfr;
+        } else {
+            smoothed_cfr_ema =
+                    cfr_ema_decay * smoothed_cfr_ema +
+                    cfr_ema_update * cfr;
+        }
+
+        if (full_pop_count >= classify_start &&
+            full_pop_count <= classify_end) {
+            classify_smoothed_cfr_sum += smoothed_cfr_ema;
+            classify_smoothed_cfr_count++;
+
+            if (!classification_evaluated &&
+                full_pop_count == classify_end) {
+                classification_evaluated = true;
+                if (direct_classifier_threshold_enabled) {
+                    classify_cfr_mean = classify_smoothed_cfr_sum /
+                            static_cast<float>(classify_smoothed_cfr_count);
+                    is_easy_query =
+                            classify_cfr_mean <= params.early_stop_ratio;
+                    if (is_easy_query) {
+                        const float classify_cfr_ratio =
+                                classify_cfr_mean /
+                                std::max(params.early_stop_ratio, 1e-6f);
+                        if (super_easy_policy_enabled) {
+                            is_super_easy_query =
+                                    classify_cfr_ratio <=
+                                    params.super_easy_gamma_ratio;
+                        }
+                        if (mid_easy_bucket_policy_enabled) {
+                            is_mid_easy_query =
+                                    classify_cfr_ratio <=
+                                    params.mid_easy_upper_gamma_ratio;
+                        }
+                    }
+                }
+
+                if (!effective_ef_shrink_applied) {
+                    size_t shrunk_ef_cur = configured_ef_cur;
+                    if (params.paper_bucket_mode) {
+                        if (is_easy_query) {
+                            const float classify_cfr_ratio =
+                                    classify_cfr_mean /
+                                    std::max(params.early_stop_ratio, 1e-6f);
+                            shrunk_ef_cur = resolve_paper_bucket_shrink_ef(
+                                    configured_ef_cur,
+                                    static_cast<size_t>(k_search),
+                                    params,
+                                    classify_cfr_ratio);
+                        }
+                    } else {
+                        const size_t shrink_super_easy_ef =
+                                resolve_scaled_shrink_ef(
+                                        configured_ef_cur,
+                                        0.25,
+                                        128);
+                        const size_t shrink_easy_ef =
+                                std::max<size_t>(1, configured_ef_cur / 2);
+                        const size_t shrink_mid_easy_ef =
+                                resolve_scaled_shrink_ef(
+                                        configured_ef_cur,
+                                        0.50,
+                                        128);
+                        const size_t shrink_edge_easy_ef =
+                                resolve_scaled_shrink_ef(
+                                        configured_ef_cur,
+                                        0.75,
+                                        256);
+
+                        if (super_easy_policy_enabled && is_super_easy_query) {
+                            shrunk_ef_cur = shrink_super_easy_ef;
+                        } else if (is_easy_query) {
+                            if (mid_easy_bucket_policy_enabled) {
+                                shrunk_ef_cur = is_mid_easy_query
+                                        ? shrink_mid_easy_ef
+                                        : shrink_edge_easy_ef;
+                            } else {
+                                shrunk_ef_cur = shrink_easy_ef;
+                            }
+                        }
+                        shrunk_ef_cur = std::max<size_t>(
+                                shrunk_ef_cur,
+                                static_cast<size_t>(k_search));
+                    }
+
+                    if (shrunk_ef_cur < ef_cur) {
+                        ef_cur = shrunk_ef_cur;
+                        shrink_minimax_heap_capacity(candidates, ef_cur);
+                        if (candidates.k > 0) {
+                            stagnation_boundary_rank =
+                                    resolve_stagnation_boundary_rank(
+                                            ef_cur,
+                                            hard_stagnation_boundary_fraction);
+                            stagnation_boundary_dist =
+                                    raw_distance_to_external_distance(
+                                            minimax_heap_rank_boundary(
+                                                    candidates,
+                                                    stagnation_boundary_rank),
+                                            similarity_metric);
+                        }
+                        prev_furthest = stagnation_boundary_dist;
+                        stagnation_count = 0;
+                        rebased_after_shrink = true;
+                    }
+                    effective_ef_shrink_applied = true;
+                }
+            }
+        }
+
+        const bool hard_stop_enabled = params.enable_stop &&
+                params.hard_stagnation_enabled &&
+                direct_classifier_threshold_enabled &&
+                classification_evaluated && !is_easy_query &&
+                full_pop_count >= effective_tmin_pops &&
+                !rebased_after_shrink;
+        bool stop_search = false;
+        if (hard_stop_enabled) {
+            if (stagnation_boundary_dist >= prev_furthest) {
+                stagnation_count++;
+            } else {
+                stagnation_count = 0;
+            }
+
+            if (static_cast<size_t>(std::max(stagnation_count, 0)) >=
+                hard_only_stag_limit) {
+                stopped_by_hard_stagnation = true;
+                stop_search = true;
+            }
+        }
+
+        prev_furthest = stagnation_boundary_dist;
+        return stop_search;
     };
 
     while (candidates.size() > 0) {
@@ -1048,6 +1501,27 @@ int search_from_candidates_adaptive_light(
         if (candidates.count_below(candidate_dist) >=
             static_cast<int>(ef_cur)) {
             break;
+        }
+
+        const bool pre_expansion_full =
+                candidates.k >= static_cast<int>(ef_cur);
+        const bool full_cfr_needed = direct_classifier_threshold_enabled &&
+                (!classification_evaluated ||
+                 (params.enable_stop && params.hard_stagnation_enabled &&
+                  !is_easy_query));
+
+        bool stop_search = false;
+        if (pre_expansion_full && full_cfr_needed) {
+            const float pre_expansion_frontier_dist =
+                    raw_distance_to_external_distance(
+                            candidates.max(), similarity_metric);
+            stop_search = observe_cfr_full_pop(
+                    candidate_dist,
+                    pre_expansion_frontier_dist);
+            if (stop_search) {
+                nstep++;
+                break;
+            }
         }
 
         size_t begin, end;
@@ -1083,8 +1557,14 @@ int search_from_candidates_adaptive_light(
                         dis[2],
                         dis[3]);
 
-                for (int id4 = 0; id4 < 4; id4++) {
-                    add_to_heap(saved_j[id4], dis[id4]);
+                if (shadow_tracking_active()) {
+                    for (int id4 = 0; id4 < 4; id4++) {
+                        add_to_heap_with_shadow(saved_j[id4], dis[id4]);
+                    }
+                } else {
+                    for (int id4 = 0; id4 < 4; id4++) {
+                        add_to_heap_plain(saved_j[id4], dis[id4]);
+                    }
                 }
 
                 ndis += 4;
@@ -1092,153 +1572,30 @@ int search_from_candidates_adaptive_light(
             }
         }
 
+        const bool update_shadow_candidates = shadow_tracking_active();
         for (int icnt = 0; icnt < counter; icnt++) {
             float dis = qdis(saved_j[icnt]);
-            add_to_heap(saved_j[icnt], dis);
+            if (update_shadow_candidates) {
+                add_to_heap_with_shadow(saved_j[icnt], dis);
+            } else {
+                add_to_heap_plain(saved_j[icnt], dis);
+            }
             ndis += 1;
         }
 
-        bool stop_search = false;
-        if (candidates.k >= static_cast<int>(ef_cur)) {
-            full_pop_count++;
-            float furthest_dist = raw_distance_to_external_distance(
-                    candidates.max(), similarity_metric);
-            const float candidate_dist_external =
-                    raw_distance_to_external_distance(
-                            candidate_dist,
-                            similarity_metric);
-            const float cfr =
-                    candidate_dist_external / std::max(furthest_dist, 1e-6f);
-            bool rebased_after_shrink = false;
-
-            if (std::isnan(smoothed_cfr_ema)) {
-                smoothed_cfr_ema = cfr;
-            } else {
-                smoothed_cfr_ema =
-                        cfr_ema_decay * smoothed_cfr_ema +
-                        cfr_ema_update * cfr;
-            }
-
-            if (full_pop_count >= classify_start &&
-                full_pop_count <= classify_end) {
-                classify_smoothed_cfr_sum += smoothed_cfr_ema;
-                classify_smoothed_cfr_count++;
-
-                if (!classification_evaluated &&
-                    full_pop_count == classify_end) {
-                    classification_evaluated = true;
-                    if (direct_classifier_threshold_enabled) {
-                        classify_cfr_mean = classify_smoothed_cfr_sum /
-                                static_cast<float>(classify_smoothed_cfr_count);
-                        is_easy_query =
-                                classify_cfr_mean <= params.early_stop_ratio;
-                        if (is_easy_query) {
-                            const float classify_cfr_ratio =
-                                    classify_cfr_mean /
-                                    std::max(params.early_stop_ratio, 1e-6f);
-                            if (super_easy_policy_enabled) {
-                                is_super_easy_query =
-                                        classify_cfr_ratio <=
-                                        params.super_easy_gamma_ratio;
-                            }
-                            if (mid_easy_bucket_policy_enabled) {
-                                is_mid_easy_query =
-                                        classify_cfr_ratio <=
-                                        params.mid_easy_upper_gamma_ratio;
-                            }
-                        }
-                    }
-
-                    if (!effective_ef_shrink_applied) {
-                        size_t shrunk_ef_cur = configured_ef_cur;
-                        if (params.paper_bucket_mode) {
-                            if (is_easy_query) {
-                                const float classify_cfr_ratio =
-                                        classify_cfr_mean /
-                                        std::max(params.early_stop_ratio, 1e-6f);
-                                shrunk_ef_cur = resolve_paper_bucket_shrink_ef(
-                                        configured_ef_cur,
-                                        static_cast<size_t>(k_search),
-                                        params,
-                                        classify_cfr_ratio);
-                            }
-                        } else {
-                            const size_t shrink_super_easy_ef =
-                                    resolve_scaled_shrink_ef(
-                                            configured_ef_cur,
-                                            0.25,
-                                            128);
-                            const size_t shrink_easy_ef =
-                                    std::max<size_t>(1, configured_ef_cur / 2);
-                            const size_t shrink_mid_easy_ef =
-                                    resolve_scaled_shrink_ef(
-                                            configured_ef_cur,
-                                            0.50,
-                                            128);
-                            const size_t shrink_edge_easy_ef =
-                                    resolve_scaled_shrink_ef(
-                                            configured_ef_cur,
-                                            0.75,
-                                            256);
-
-                            if (super_easy_policy_enabled && is_super_easy_query) {
-                                shrunk_ef_cur = shrink_super_easy_ef;
-                            } else if (is_easy_query) {
-                                if (mid_easy_bucket_policy_enabled) {
-                                    shrunk_ef_cur = is_mid_easy_query
-                                            ? shrink_mid_easy_ef
-                                            : shrink_edge_easy_ef;
-                                } else {
-                                    shrunk_ef_cur = shrink_easy_ef;
-                                }
-                            }
-                            shrunk_ef_cur = std::max<size_t>(
-                                    shrunk_ef_cur,
-                                    static_cast<size_t>(k_search));
-                        }
-
-                        if (shrunk_ef_cur < ef_cur) {
-                            ef_cur = shrunk_ef_cur;
-                            shrink_minimax_heap_capacity(candidates, ef_cur);
-                            if (candidates.k > 0) {
-                                furthest_dist =
-                                        raw_distance_to_external_distance(
-                                                candidates.max(),
-                                                similarity_metric);
-                            }
-                            prev_furthest = furthest_dist;
-                            stagnation_count = 0;
-                            rebased_after_shrink = true;
-                        }
-                        effective_ef_shrink_applied = true;
-                    }
-                }
-            }
-
-            const bool hard_stop_enabled = params.enable_stop &&
-                    params.hard_stagnation_enabled &&
-                    direct_classifier_threshold_enabled &&
-                    classification_evaluated && !is_easy_query &&
-                    full_pop_count >= effective_tmin_pops &&
-                    !rebased_after_shrink;
-            if (hard_stop_enabled) {
-                if (furthest_dist >= prev_furthest) {
-                    stagnation_count++;
-                } else {
-                    stagnation_count = 0;
-                }
-
-                if (static_cast<size_t>(std::max(stagnation_count, 0)) >=
-                    hard_only_stag_limit) {
-                    stopped_by_hard_stagnation = true;
-                    stop_search = true;
-                }
-            }
-
-            prev_furthest = furthest_dist;
-        }
-
         nstep++;
+        if (shadow_tracking_active()) {
+            observe_shadow_cfr_after_expansion(
+                    candidate_dist, static_cast<size_t>(nstep));
+        }
+        if (params.enable_stop && shadow_classifier_enabled &&
+            !shadow_bucket_classifier_enabled &&
+            shadow_is_easy_query && shadow_decision_step > 0 &&
+            shadow_decision_step <= shadow_selected_stop_budget &&
+            static_cast<size_t>(nstep) >= shadow_selected_stop_budget) {
+            stopped_by_shadow = true;
+            break;
+        }
         if (stop_search) {
             break;
         }
@@ -1251,6 +1608,7 @@ int search_from_candidates_adaptive_light(
     stats.ndis += ndis;
     stats.nhops += nstep;
     stats.hard_stagnation_stops += stopped_by_hard_stagnation ? 1 : 0;
+    stats.shadow_stops += stopped_by_shadow ? 1 : 0;
 
     return 0;
 }
@@ -2008,6 +2366,46 @@ HNSWStats HNSW::search_adaptive_light(
             res,
             k,
             nearest,
+            d_nearest,
+            vt,
+            stats,
+            *active_params);
+
+    return stats;
+}
+
+HNSWStats HNSW::search_adaptive_light_from_entry_point(
+        DistanceComputer& qdis,
+        const IndexHNSW* index,
+        ResultHandler& res,
+        VisitedTable& vt,
+        storage_idx_t external_entry_point,
+        const SearchParametersHNSWAdaptiveLight* params) const {
+    FAISS_THROW_IF_NOT(index);
+    FAISS_THROW_IF_NOT_FMT(
+            external_entry_point >= 0 &&
+                    static_cast<idx_t>(external_entry_point) < index->ntotal,
+            "external entry point %d is outside [0, %" PRId64 ")",
+            external_entry_point,
+            index->ntotal);
+
+    SearchParametersHNSWAdaptiveLight default_params;
+    default_params.efSearch = this->efSearch;
+    default_params.bounded_queue = true;
+    const SearchParametersHNSWAdaptiveLight* active_params =
+            params ? params : &default_params;
+
+    HNSWStats stats;
+    const int k = extract_k_from_ResultHandler(res);
+    const float d_nearest = qdis(external_entry_point);
+
+    search_from_candidates_adaptive_light(
+            *this,
+            index,
+            qdis,
+            res,
+            k,
+            external_entry_point,
             d_nearest,
             vt,
             stats,
